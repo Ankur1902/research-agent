@@ -1,0 +1,62 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: researchos
+      MYSQL_USER: researchos
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-researchos}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-root-change-me}
+    volumes: [mysql-data:/var/lib/mysql]
+    healthcheck:
+      test: [CMD-SHELL, "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, "yes"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  qdrant:
+    image: qdrant/qdrant:v1.19.0
+    volumes: [qdrant-data:/qdrant/storage]
+  migrate:
+    build: {context: ., dockerfile: docker/api.Dockerfile}
+    env_file: .env
+    command: [alembic, -c, apps/api/alembic.ini, upgrade, head]
+    depends_on:
+      mysql: {condition: service_healthy}
+  api:
+    build: {context: ., dockerfile: docker/api.Dockerfile}
+    env_file: .env
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_started}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+  worker:
+    build: {context: ., dockerfile: docker/api.Dockerfile}
+    env_file: .env
+    command: [arq, app.workers.worker.WorkerSettings]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_started}
+  web:
+    build: {context: ., dockerfile: docker/web.Dockerfile}
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on:
+      api: {condition: service_healthy}
+volumes:
+  mysql-data:
+  redis-data:
+  qdrant-data:
