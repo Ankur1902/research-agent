@@ -1,0 +1,6 @@
+Lightweight research test note (synthetic business example).
+Research plans require human approval before execution.
+Source passages should be stored with citations for inspection.
+Reports require a second human approval before publication.
+January revenue was 100 USD and February revenue was 125 USD.
+The revenue values describe the same fictional business and the same monthly accounting definition.

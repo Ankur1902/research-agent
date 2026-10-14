@@ -7,6 +7,7 @@ from typing import Annotated, cast
 
 from app.core.config import settings
 from app.core.db import db
+from app.evaluation.execution import execution_summary
 from app.evaluation.metrics import evaluate_report
 from app.models.entities import (
     Audit,
@@ -248,6 +249,14 @@ async def trace(research_id: str, session: DB, identity: Identity):
             .order_by(Event.sequence)
         )
     ]
+
+
+@router.get("/research/{research_id}/execution")
+async def execution_details(research_id: str, session: DB, identity: Identity):
+    job = await owned(session, Research, research_id, identity["org"])
+    events = list((await session.scalars(select(Event).where(Event.research_id == research_id,
+                   Event.organization_id == identity["org"]).order_by(Event.sequence))).all())
+    return execution_summary(job, events)
 
 
 @router.get("/research/{research_id}/usage")

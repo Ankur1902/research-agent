@@ -64,6 +64,31 @@ export interface Trace {
   created_at: string;
   details: Record<string, unknown>;
 }
+export interface ExecutionSummary {
+  mode: string;
+  retrieval_backend: string | null;
+  time_to_draft_ms: number | null;
+  processing_ms: number | null;
+  planning_ms: number | null;
+  execution_ms: number | null;
+  approval_wait_ms: number | null;
+  llm_calls: number;
+  tool_calls: number;
+  tools_by_name: Record<string, number>;
+  model_calls: {
+    agent: string;
+    provider?: string;
+    model?: string;
+    latency_ms?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+  }[];
+  tool_activity: {
+    name: string;
+    arguments?: Record<string, unknown>;
+    call_number?: number;
+  }[];
+}
 export interface Document {
   id: string;
   name: string;

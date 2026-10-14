@@ -1,10 +1,12 @@
 import asyncio
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
+from app.agents.design import DEPTH_QUERY_LIMITS, MODEL_STAGES, route_plan
 from app.core.config import settings
 from app.core.db import Session
 from app.models.entities import Document, Event, Organization, Research, Source, Usage, now
@@ -27,7 +29,6 @@ class Stopped(Exception):
 class Workflow:
     def __init__(self, session, job):
         self.session, self.job = session, job
-        self.steps = 0
         self.tools = research_tools(lambda query: retrieve(self.session, self.job.organization_id, query))
 
     async def checkpoint(self):
@@ -76,8 +77,15 @@ class Workflow:
 
     async def generate(self, agent, data, schema):
         await self.checkpoint()
-        self.steps += 1
-        if self.steps > settings().max_steps:
+        if agent not in MODEL_STAGES:
+            raise ValueError("Unknown model stage")
+        prior_calls = (
+            await self.session.scalar(
+                select(func.count(Event.id)).where(Event.research_id == self.job.id, Event.type == "agent_started")
+            )
+            or 0
+        )
+        if prior_calls >= settings().max_steps:
             raise ValueError("Maximum agent steps exceeded")
         config = settings()
         context = json.dumps(data)
@@ -89,13 +97,21 @@ class Workflow:
         ) / 1_000_000
         if self.job.cost + reservation > self.job.budget:
             raise ValueError("Insufficient budget for next model call")
+        prompt = (PROMPTS / agent / "v1.txt").read_text(encoding="utf-8-sig")
         await self.event(
             agent,
             "agent_started",
             f"{agent.replace('_', ' ').title()} started",
-            {"context_chars": len(context), "prompt_version": "v1"},
+            {
+                "context_chars": len(context),
+                "prompt_version": "v1",
+                "prompt_sha256": digest(prompt),
+                "logical_call_number": prior_calls + 1,
+                "provider": config.llm_provider,
+                "model": config.llm_model,
+            },
         )
-        result = await llm().complete((PROMPTS / agent / "v1.txt").read_text(), data, schema)
+        result = await llm().complete(prompt, data, schema)
         cost = (
             result.input_tokens * config.input_price_per_million
             + result.output_tokens * config.output_price_per_million
@@ -125,16 +141,31 @@ class Workflow:
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
                 "estimated_cost": cost,
+                "provider": config.llm_provider,
+                "model": config.llm_model,
+                "http_attempts": result.http_attempts,
             },
         )
         return result.value
 
-    async def tool(self, name):
+    async def tool(self, name, arguments=None):
         await self.checkpoint()
+        if self.job.status != "RUNNING":
+            raise PermissionError("Retrieval and calculations require the approved execution phase")
         if self.job.tool_calls >= settings().max_tool_calls:
             raise ValueError("Maximum tool calls exceeded")
         self.job.tool_calls += 1
-        await self.event(name, "tool_called", name)
+        await self.event(
+            name,
+            "tool_called",
+            name,
+            {
+                "call_number": self.job.tool_calls,
+                "approval_verified": True,
+                "phase": self.job.status,
+                "arguments": arguments or {},
+            },
+        )
 
     async def source(self, title, url, evidence, metadata):
         content_hash = digest(evidence)
@@ -162,12 +193,13 @@ class Workflow:
         )
 
     async def collect_web(self, queries):
-        query_limit = {"quick": 2, "standard": 3, "deep": 4}[self.job.depth]
+        query_limit = DEPTH_QUERY_LIMITS[self.job.depth]
         for query in queries[:query_limit]:
-            await self.tool("web_search")
             if self.job.cost + settings().search_price_per_call > self.job.budget:
                 raise ValueError("Insufficient search budget")
-            results = await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True)
+            await self.tool("web_search", {"query": query})
+            results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
+            results = list({result["url"]: result for result in results}.values())
             self.job.cost += settings().search_price_per_call
             await self.session.commit()
 
@@ -184,8 +216,10 @@ class Workflow:
                 except Exception as exc:
                     return result, "", type(exc).__name__
 
+            if self.job.tool_calls + len(results) > settings().max_tool_calls:
+                raise ValueError("Insufficient tool-call budget for fetch batch")
             for result in results:
-                await self.tool("fetch_webpage")
+                await self.tool("fetch_webpage", {"url": result["url"]})
             for result, evidence, error in await asyncio.gather(*(fetch(result) for result in results)):
                 if error:
                     await self.event(
@@ -207,18 +241,20 @@ class Workflow:
                         },
                     )
 
-    async def collect_documents(self):
-        await self.tool("document_search")
-        for chunk in await self.tools.call(
-            "document_search", {"query": self.job.question}, role="RESEARCHER", approved=True
-        ):
-            document = await self.session.get(Document, chunk.document_id)
-            await self.source(
-                document.name,
-                f"document:{document.id}#page={chunk.page}",
-                chunk.text,
-                {"page": chunk.page, "chunk_id": chunk.id, "type": "document"},
-            )
+    async def collect_documents(self, queries):
+        for query in queries:
+            await self.tool("document_search", {"query": query})
+            chunks = await self.tools.call("document_search", {"query": query}, role="RESEARCHER", approved=True)
+            for chunk in chunks:
+                document = await self.session.get(Document, chunk.document_id)
+                if document is None or document.organization_id != self.job.organization_id:
+                    raise PermissionError("Retrieved document does not belong to the active organization")
+                await self.source(
+                    document.name,
+                    f"document:{document.id}#page={chunk.page}",
+                    chunk.text,
+                    {"page": chunk.page, "chunk_id": chunk.id, "type": "document"},
+                )
 
     async def plan(self):
         if detect_injection(self.job.question):
@@ -228,6 +264,7 @@ class Workflow:
             {"question": self.job.question, "source_mode": self.job.source_mode, "depth": self.job.depth},
             Plan,
         )
+        route_plan(plan, self.job.source_mode, self.job.depth)
         self.job.plan = plan.model_dump()
         await self.transition("PLANNING", "WAITING_FOR_APPROVAL")
         await self.event(
@@ -236,10 +273,11 @@ class Workflow:
 
     async def execute(self):
         plan = Plan.model_validate(self.job.plan)
-        if self.job.source_mode in {"web", "both"}:
-            await self.collect_web([task.question for task in plan.tasks])
-        if self.job.source_mode in {"documents", "both"}:
-            await self.collect_documents()
+        routing = route_plan(plan, self.job.source_mode, self.job.depth)
+        if routing.web_queries:
+            await self.collect_web(routing.web_queries)
+        if routing.document_queries:
+            await self.collect_documents(routing.document_queries)
         sources = list((await self.session.scalars(select(Source).where(Source.research_id == self.job.id))).all())
         evidence = [
             {"citation": source.citation, "title": source.title, "untrusted_evidence": source.evidence[:2000]}
@@ -261,13 +299,13 @@ class Workflow:
                 not source
                 or not computation.quote
                 or computation.quote not in source.evidence
-                or any(value not in quoted_numbers for value in computation.values)
+                or any(count > Counter(quoted_numbers)[value] for value, count in Counter(computation.values).items())
             ):
                 analysis.limitations.append(
                     "A requested calculation was rejected because its inputs were not grounded in a source quote."
                 )
                 continue
-            await self.tool("calculator")
+            await self.tool("calculator", {"operation": computation.operation, "values": computation.values})
             result = await registry.call(
                 "calculator", {"operation": computation.operation, "values": computation.values}, role="RESEARCHER"
             )
@@ -369,6 +407,19 @@ async def run_research(ctx, research_id: str, planning: bool = True):
         workflow = Workflow(session, job)
         try:
             async with asyncio.timeout(600):
+                if not planning:
+                    await workflow.event(
+                        "manager",
+                        "execution_authorized",
+                        "Approved research execution started",
+                        {
+                            "previous_status": "APPROVED",
+                            "mode": job.mode,
+                            "retrieval_backend": settings().retrieval_backend,
+                        },
+                    )
+                else:
+                    await workflow.event("manager", "planning_started", "Research planning started")
                 if job.mode == "DEMO":
                     await workflow.demo(planning)
                 elif planning:

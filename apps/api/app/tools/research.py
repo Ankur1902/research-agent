@@ -1,14 +1,16 @@
 from app.security.guards import fetch_public
 from app.services.providers import search_provider
 from app.tools.registry import Tool, ToolRegistry
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class QueryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     query: str = Field(min_length=1, max_length=4000)
 
 
 class FetchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     url: str = Field(min_length=1, max_length=2000)
 
 

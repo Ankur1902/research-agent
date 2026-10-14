@@ -89,6 +89,11 @@ class LexicalReranker(Reranker):
 
 
 async def index_document(session, document: Document):
+    if settings().retrieval_backend == "lexical":
+        document.status = "INDEXED"
+        document.error = None
+        await session.commit()
+        return
     client = AsyncQdrantClient(url=settings().qdrant_url)
     try:
         chunks = list((await session.scalars(select(Chunk).where(Chunk.document_id == document.id))).all())
@@ -142,6 +147,10 @@ async def retrieve(session, organization_id, query):
     )
     if not chunks:
         return []
+    if settings().retrieval_backend == "lexical":
+        ranked = lexical_rank(query, chunks)
+        mapping = {chunk.id: chunk for chunk in chunks}
+        return [mapping[key] for key in ranked[:8]]
     vector = (await embed([query]))[0]
     client = AsyncQdrantClient(url=settings().qdrant_url)
     try:

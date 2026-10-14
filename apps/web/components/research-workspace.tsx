@@ -13,7 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { Research, Source, Trace } from "@/lib/types";
+import type { ExecutionSummary, Research, Source, Trace } from "@/lib/types";
 import { Badge, ErrorMessage } from "./ui";
 import { EvidenceDialog } from "./evidence-dialog";
 export function ResearchWorkspace({
@@ -39,6 +39,17 @@ export function ResearchWorkspace({
     queryKey: ["trace", id],
     queryFn: () => api<Trace[]>(`/research/${id}/trace`),
   });
+  const { data: execution } = useQuery({
+    queryKey: ["execution", id],
+    queryFn: () => api<ExecutionSummary>(`/research/${id}/execution`),
+    refetchInterval:
+      job &&
+      !["REVIEW", "COMPLETED", "FAILED", "CANCELLED"].includes(job.status)
+        ? 2000
+        : false,
+  });
+  const seconds = (value: number | null | undefined) =>
+    value == null ? "Pending" : `${(value / 1000).toFixed(2)}s`;
   useEffect(() => {
     if (
       !job ||
@@ -59,11 +70,13 @@ export function ResearchWorkspace({
       );
       if (value.type === "source_found")
         client.invalidateQueries({ queryKey: ["sources", id] });
+      client.invalidateQueries({ queryKey: ["execution", id] });
     };
     stream.addEventListener("checkpoint", () => {
       stream.close();
       client.invalidateQueries({ queryKey: ["research", id] });
       client.invalidateQueries({ queryKey: ["sources", id] });
+      client.invalidateQueries({ queryKey: ["execution", id] });
     });
     return () => stream.close();
   }, [id, job, client]);
@@ -73,6 +86,7 @@ export function ResearchWorkspace({
     try {
       await api(`/research/${id}/${name}`, { method: "POST" });
       await client.invalidateQueries({ queryKey: ["research", id] });
+      await client.invalidateQueries({ queryKey: ["execution", id] });
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
@@ -106,6 +120,52 @@ export function ResearchWorkspace({
           </span>
         </div>
       </div>
+      {execution && (
+        <section
+          className="panel execution-summary"
+          aria-label="Execution summary"
+        >
+          <h3>Execution summary</h3>
+          <div className="execution-totals">
+            <span>
+              <b>{seconds(execution.time_to_draft_ms)}</b>
+              <small>Total time to draft</small>
+            </span>
+            <span>
+              <b>{seconds(execution.processing_ms)}</b>
+              <small>Agent processing time</small>
+            </span>
+            <span>
+              <b>{execution.llm_calls}</b>
+              <small>LLM calls</small>
+            </span>
+            <span>
+              <b>{execution.tool_calls}</b>
+              <small>Tool calls</small>
+            </span>
+          </div>
+          <p className="muted">
+            Total includes queueing and plan approval. Approval wait:{" "}
+            {seconds(execution.approval_wait_ms)}. Retrieval:{" "}
+            {execution.retrieval_backend || "Not started"}.
+          </p>
+          <div className="execution-calls">
+            {execution.model_calls.map((call, i) => (
+              <span key={`model-${i}`}>
+                <b>{call.agent}</b> · {call.provider || "LLM"} /{" "}
+                {call.model || "unknown model"} · {seconds(call.latency_ms)} ·{" "}
+                {call.input_tokens || 0} input / {call.output_tokens || 0}{" "}
+                output tokens
+              </span>
+            ))}
+            {execution.tool_activity.map((call, i) => (
+              <span key={`tool-${i}`}>
+                <b>{call.name}</b> · {JSON.stringify(call.arguments || {})}
+              </span>
+            ))}
+          </div>
+        </section>
+      )}
       {job.mode === "DEMO" && (
         <div className="demo-notice">
           DEMO — local fixture only. This is not evidence about your research

@@ -1,16 +1,24 @@
 import csv
 import io
+import math
 import statistics
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Calculation(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     operation: str = Field(pattern="^(sum|mean|min|max|growth_percent)$")
     values: list[float] = Field(min_length=1, max_length=10000)
+
+    @model_validator(mode="after")
+    def valid_growth(self):
+        if self.operation == "growth_percent" and (len(self.values) != 2 or self.values[0] == 0):
+            raise ValueError("Growth requires two values and a nonzero base")
+        return self
 
 
 def calculate(data: Calculation) -> dict:
@@ -27,14 +35,25 @@ def calculate(data: Calculation) -> dict:
             "max": lambda: max(values),
         }
         result = operations[data.operation]()
-    return {"result": float(result), "operation": data.operation}
+    output = float(result)
+    if not math.isfinite(output):
+        raise ValueError("Calculation result exceeds finite numeric limits")
+    return {"result": output, "operation": data.operation}
 
 
 def inspect_csv(text: str, column: str) -> dict:
-    rows = list(csv.DictReader(io.StringIO(text)))
-    if len(rows) > 10000:
-        raise ValueError("CSV row limit exceeded")
-    values = [float(row[column]) for row in rows if row.get(column)]
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames or len(set(reader.fieldnames)) != len(reader.fieldnames) or column not in reader.fieldnames:
+        raise ValueError("CSV requires unique headers and an existing numeric column")
+    values = []
+    for index, row in enumerate(reader):
+        if index >= 10000:
+            raise ValueError("CSV row limit exceeded")
+        if row.get(column):
+            value = float(row[column])
+            if not math.isfinite(value):
+                raise ValueError("CSV contains a nonfinite numeric value")
+            values.append(value)
     if not values:
         raise ValueError("No numeric values in requested column")
     return {
@@ -71,7 +90,9 @@ class ToolRegistry:
         tool = self.tools.get(name)
         if not tool:
             raise ValueError("Tool is not allowlisted")
-        if role == "VIEWER" or (tool.permission == "HIGH_IMPACT" and not approved):
+        if role not in {"OWNER", "ADMIN", "RESEARCHER"}:
+            raise PermissionError("Tool requires an authorized workspace role")
+        if tool.permission in {"READ_ONLY", "SENSITIVE", "HIGH_IMPACT"} and not approved:
             raise PermissionError("Tool requires authorization")
         result = tool.handler(tool.schema.model_validate(arguments))
         return await result if inspect.isawaitable(result) else result

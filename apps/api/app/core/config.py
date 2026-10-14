@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -20,6 +21,7 @@ class Settings(BaseSettings):
     search_provider: str = "tavily"
     search_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
+    retrieval_backend: Literal["hybrid", "lexical"] = "hybrid"
     input_price_per_million: float = 0.4
     output_price_per_million: float = 1.6
     search_price_per_call: float = 0.008

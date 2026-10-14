@@ -103,6 +103,7 @@ async def test_complete_demo_flow_and_tenant_isolation():
                 f"/research/{job_id}",
                 f"/research/{job_id}/sources",
                 f"/research/{job_id}/trace",
+                f"/research/{job_id}/execution",
                 f"/research/{job_id}/export",
                 f"/research/{job_id}/events",
             ]:

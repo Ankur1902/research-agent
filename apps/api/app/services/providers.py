@@ -8,6 +8,8 @@ import httpx
 from app.core.config import settings
 from pydantic import BaseModel
 
+MAX_PROVIDER_HTTP_ATTEMPTS = 3
+
 
 @dataclass
 class Completion:
@@ -16,6 +18,7 @@ class Completion:
     output_tokens: int
     latency_ms: int
     request_id: str
+    http_attempts: int | None = None
 
 
 class LLMProvider(ABC):
@@ -25,15 +28,19 @@ class LLMProvider(ABC):
 
 async def request_json(url, headers, body):
     async with httpx.AsyncClient(timeout=90) as client:
-        for attempt in range(3):
+        for attempt in range(MAX_PROVIDER_HTTP_ATTEMPTS):
             try:
                 response = await client.post(url, headers=headers, json=body)
                 response.raise_for_status()
-                return response.json()
+                result = response.json()
+                if not isinstance(result, dict):
+                    raise RuntimeError("Provider returned an invalid JSON envelope")
+                result["_researchos_http_attempts"] = attempt + 1
+                return result
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in {429, 500, 502, 503, 504}:
                     raise RuntimeError(f"Provider rejected request ({exc.response.status_code})") from None
-                if attempt == 2:
+                if attempt == MAX_PROVIDER_HTTP_ATTEMPTS - 1:
                     raise RuntimeError("Provider unavailable after bounded retries") from None
                 await asyncio.sleep(2**attempt)
     raise RuntimeError("Provider request failed")
@@ -64,6 +71,7 @@ class OpenAIProvider(LLMProvider):
             result["usage"]["completion_tokens"],
             int((time.monotonic() - start) * 1000),
             result["id"],
+            result.get("_researchos_http_attempts"),
         )
 
 
@@ -91,7 +99,36 @@ class AnthropicProvider(LLMProvider):
             result["usage"]["output_tokens"],
             int((time.monotonic() - start) * 1000),
             result["id"],
+            result.get("_researchos_http_attempts"),
         )
+
+
+def gemini_schema(schema: type[BaseModel]) -> dict:
+    """Inline local references and omit transport-only size constraints.
+
+    Gemini rejects some complex bounded-array schemas. The original Pydantic
+    model remains authoritative for all bounds and extra-field validation.
+    """
+    source = schema.model_json_schema()
+    definitions = source.get("$defs", {})
+
+    def convert(node, refs=()):
+        if isinstance(node, list):
+            return [convert(item, refs) for item in node]
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            name = node["$ref"].removeprefix("#/$defs/")
+            if name not in definitions or name in refs:
+                raise ValueError("Unsupported recursive or external Gemini schema reference")
+            return convert(definitions[name], (*refs, name))
+        return {
+            key: convert(value, refs)
+            for key, value in node.items()
+            if key not in {"$defs", "maxItems", "minItems", "minLength", "maxLength"}
+        }
+
+    return convert(source)
 
 
 class GeminiProvider(LLMProvider):
@@ -108,18 +145,29 @@ class GeminiProvider(LLMProvider):
                 "contents": [{"parts": [{"text": json.dumps(data)}]}],
                 "generationConfig": {
                     "responseMimeType": "application/json",
-                    "responseJsonSchema": schema.model_json_schema(),
+                    "responseJsonSchema": gemini_schema(schema),
                     "maxOutputTokens": 4000,
                 },
             },
         )
-        usage = result["usageMetadata"]
+        candidates = result.get("candidates", [])
+        if not candidates or candidates[0].get("finishReason") not in {None, "STOP"}:
+            raise ValueError("Gemini did not return a complete structured response")
+        content = "".join(
+            part.get("text", "")
+            for part in candidates[0].get("content", {}).get("parts", [])
+            if not part.get("thought", False)
+        )
+        if not content:
+            raise ValueError("Gemini returned no structured text")
+        usage = result.get("usageMetadata", {})
         return Completion(
-            schema.model_validate_json(result["candidates"][0]["content"]["parts"][0]["text"]),
-            usage["promptTokenCount"],
-            usage.get("candidatesTokenCount", 0),
+            schema.model_validate_json(content),
+            usage.get("promptTokenCount", 0),
+            usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
             int((time.monotonic() - start) * 1000),
             result.get("responseId", ""),
+            result.get("_researchos_http_attempts"),
         )
 
 
