@@ -45,3 +45,13 @@ class LocalQueue:
                 logger.error("Local task failed: %s", name)
             finally:
                 self.jobs.task_done()
+
+    async def recover(self):
+        from app.workers.recovery import recover_research
+
+        while True:
+            try:
+                await recover_research({"redis": self})
+            except Exception:
+                logger.exception("Local research recovery failed")
+            await asyncio.sleep(30)

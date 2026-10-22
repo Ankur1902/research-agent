@@ -62,3 +62,22 @@ async def test_transient_errors_stop_at_transport_limit(monkeypatch):
     with pytest.raises(RuntimeError, match="bounded retries"):
         await providers.request_json("https://fixture.invalid/completions", {}, {})
     assert len(attempts) == providers.MAX_PROVIDER_HTTP_ATTEMPTS
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+async def test_billable_generation_does_not_replay_uncertain_outcome(monkeypatch, failure):
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Synthetic timeout", request=request)
+        return httpx.Response(503, json={"error": "synthetic"})
+
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(
+        providers.httpx, "AsyncClient", lambda **kwargs: client_type(transport=httpx.MockTransport(handler), **kwargs)
+    )
+    with pytest.raises(RuntimeError, match="uncertain"):
+        await providers.request_json("https://fixture.invalid/completions", {}, {}, retry_ambiguous=False)
+    assert len(attempts) == 1

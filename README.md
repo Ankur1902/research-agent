@@ -4,6 +4,8 @@ A multi-agent research workspace that plans investigations, retrieves evidence, 
 
 ## Start locally
 
+For Docker-free Gemini development, see [the local setup](docs/DEVELOPMENT.md#docker-free-gemini-development). Existing installations should read [the upgrade and migration notes](docs/UPGRADE.md).
+
 ```bash
 cp .env.example .env
 docker compose up --build
@@ -67,6 +69,6 @@ Optional seed: register an account, set `SEED_EMAIL` to it, and execute `scripts
 
 ## Known limitations and future improvements
 
-This is a functional portfolio foundation, not a claim of enterprise readiness. The complete requested feature set remains broader than this implementation. Pending items include delivered email verification/password reset, MFA/SSO, membership administration, encrypted per-tenant API-key management, malware scanning / process-isolated parsing, atomic organization spend reservations, embedding usage ledgers, dataset-wide evaluations, production telemetry integrations, rich project memory, model routing and scalable lexical indexing. Live provider behavior requires real credentials. Source verification is evidence provenance plus model assessment, not a guarantee of truth.
+This is a functional portfolio foundation, not a claim of enterprise readiness. The complete requested feature set remains broader than this implementation. Pending items include delivered email verification/password reset, MFA/SSO, membership administration, encrypted per-tenant API-key management, malware scanning / process-isolated parsing, operator spend reconciliation, embedding usage ledgers, dataset-wide semantic evaluations, production telemetry integrations, rich project memory, model routing and scalable lexical indexing. Live provider behavior requires real credentials. Source verification is evidence provenance plus model assessment, not a guarantee of truth. See the [upgrade notes](docs/UPGRADE.md) for implemented reservations and remaining recovery limits.
 
 Performance numbers and screenshots belong in the verification report only after measurement. Production rollout requires the deployment hardening and security review in the linked documents.

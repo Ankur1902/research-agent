@@ -132,6 +132,23 @@ class Evaluation(TenantEntity, Base):
     results: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class SpendReservation(TenantEntity, Base):
+    """Uncertain provider outcomes stay reserved until reconciled by an operator."""
+
+    __tablename__ = "spend_reservations"
+    research_id: Mapped[str] = mapped_column(ForeignKey("research_jobs.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    amount: Mapped[float] = mapped_column(Float)
+    actual_cost: Mapped[float] = mapped_column(Float, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="HELD", index=True)
+
+
+class RunLease(Base):
+    __tablename__ = "research_run_leases"
+    research_id: Mapped[str] = mapped_column(ForeignKey("research_jobs.id"), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
 class Audit(TenantEntity, Base):
     __tablename__ = "audit_logs"
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))

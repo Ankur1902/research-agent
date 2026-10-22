@@ -44,10 +44,12 @@ async def security_headers(request: Request, call_next):
     request_id = str(uuid.uuid4())
     try:
         if request.url.path.startswith("/api/"):
-            key = request.cookies.get("researchos_session") or (request.client.host if request.client else "unknown")
+            # Apply admission control before authentication. Client-controlled cookies
+            # must never create fresh buckets (nor trust unconfigured proxy headers).
+            key = request.client.host if request.client else "unknown"
             from app.security.guards import digest
 
-            limit_key = f"rate:{digest(key)}"
+            limit_key = f"rate:client:{digest(key)}"
             count = await request.app.state.redis.incr(limit_key)
             if count == 1:
                 await request.app.state.redis.expire(limit_key, 60)

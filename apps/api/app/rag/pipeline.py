@@ -9,7 +9,7 @@ from app.models.entities import Chunk, Document
 from app.services.providers import embed
 from pypdf import PdfReader
 from qdrant_client import AsyncQdrantClient, models
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 
 def parse_document(name: str, content: bytes) -> list[tuple[int, str]]:
@@ -135,22 +135,29 @@ async def index_document(session, document: Document):
 
 
 async def retrieve(session, organization_id, query):
+    terms = list(dict.fromkeys(tokens(query)))[:16]
+    if not terms:
+        return []
     chunks = list(
         (
             await session.scalars(
                 select(Chunk)
                 .join(Document, Document.id == Chunk.document_id)
-                .where(Chunk.organization_id == organization_id, Document.status == "INDEXED")
+                .where(
+                    Chunk.organization_id == organization_id,
+                    Document.organization_id == organization_id,
+                    Document.status == "INDEXED",
+                    or_(*(Chunk.text.icontains(term, autoescape=True) for term in terms)),
+                )
+                .order_by(Chunk.id)
                 .limit(10000)
             )
         ).all()
     )
-    if not chunks:
-        return []
     if settings().retrieval_backend == "lexical":
         ranked = lexical_rank(query, chunks)
         mapping = {chunk.id: chunk for chunk in chunks}
-        return [mapping[key] for key in ranked[:8]]
+        return diversify([mapping[key] for key in ranked])
     vector = (await embed([query]))[0]
     client = AsyncQdrantClient(url=settings().qdrant_url)
     try:
@@ -164,13 +171,36 @@ async def retrieve(session, organization_id, query):
         )
     finally:
         await client.close()
-    mapping = {chunk.id: chunk for chunk in chunks}
+    vector_ids = [str(point.id) for point in result.points]
+    vector_chunks = (
+        list(
+            (
+                await session.scalars(
+                    select(Chunk)
+                    .join(Document, Document.id == Chunk.document_id)
+                    .where(
+                        Chunk.id.in_(vector_ids),
+                        Chunk.organization_id == organization_id,
+                        Document.organization_id == organization_id,
+                        Document.status == "INDEXED",
+                    )
+                )
+            ).all()
+        )
+        if vector_ids
+        else []
+    )
+    mapping = {chunk.id: chunk for chunk in [*chunks, *vector_chunks]}
     candidate_ids = fuse([[str(point.id) for point in result.points], lexical_rank(query, chunks)[:25]])
     reranked = LexicalReranker().rank(query, [mapping[key] for key in candidate_ids if key in mapping][:30])
+    return diversify(reranked)
+
+
+def diversify(chunks: list[Chunk]) -> list[Chunk]:
     selected: list[Chunk] = []
     seen: set[str] = set()
     counts: Counter[str] = Counter()
-    for chunk in reranked:
+    for chunk in chunks:
         signature = chunk.text[:200]
         if signature not in seen and counts[chunk.document_id] < 3:
             selected.append(chunk)

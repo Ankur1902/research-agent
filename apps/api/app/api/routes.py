@@ -20,6 +20,7 @@ from app.models.entities import (
     Project,
     Research,
     Source,
+    SpendReservation,
     Usage,
     User,
     now,
@@ -173,10 +174,8 @@ async def create_research(body: ResearchInput, request: Request, session: DB, id
     try:
         await enqueue(request, "run_research", job.id, _job_id=f"plan:{job.id}")
     except HTTPException:
-        job.status = "FAILED"
-        job.error = "Background queue unavailable; create a new job after restoring Redis"
-        await session.commit()
-        raise
+        # The committed QUEUED row remains a durable intent for worker recovery.
+        pass
     return serialize(job)
 
 
@@ -206,11 +205,8 @@ async def approve(research_id: str, request: Request, session: DB, identity: Ide
         try:
             await enqueue(request, "run_research", job.id, planning=False, _job_id=f"execute:{job.id}")
         except HTTPException:
-            await session.execute(
-                update(Research).where(Research.id == job.id, Research.status == "APPROVED").values(status=previous)
-            )
-            await session.commit()
-            raise
+            # Preserve approval; recovery dispatches this durable intent later.
+            pass
     await session.refresh(job)
     return serialize(job)
 
@@ -268,6 +264,19 @@ async def usage(research_id: str, session: DB, identity: Identity):
             select(Usage).where(Usage.research_id == research_id, Usage.organization_id == identity["org"])
         )
     ]
+
+
+@router.get("/research/{research_id}/budget")
+async def budget_details(research_id: str, session: DB, identity: Identity):
+    job = await owned(session, Research, research_id, identity["org"])
+    receipts = list((await session.scalars(select(SpendReservation).where(
+        SpendReservation.research_id == research_id, SpendReservation.organization_id == identity["org"]
+    ).order_by(SpendReservation.created_at))).all())
+    held = sum(row.amount for row in receipts if row.status == "HELD")
+    return {"budget": job.budget, "estimated_spend": job.cost, "held_amount": held,
+            "available_amount": max(0, job.budget - job.cost - held),
+            "requires_reconciliation": bool(held) and job.status in {"FAILED", "CANCELLED"},
+            "reservations": [serialize(row) for row in receipts]}
 
 
 @router.get("/research/{research_id}/events")

@@ -2,18 +2,21 @@ import asyncio
 import json
 import re
 from collections import Counter
+from datetime import timedelta
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
 from app.agents.design import DEPTH_QUERY_LIMITS, MODEL_STAGES, route_plan
+from app.agents.evidence import pack_evidence
 from app.core.config import settings
 from app.core.db import Session
-from app.models.entities import Document, Event, Organization, Research, Source, Usage, now
+from app.models.entities import Document, Event, Research, RunLease, Source, Usage, now
 from app.rag.pipeline import retrieve
 from app.schemas.contracts import Analysis, Assessment, Finding, Plan, Report
 from app.security.guards import detect_injection, digest
-from app.services.providers import llm
+from app.services.budgets import reserve, settle
+from app.services.providers import RequestRejected, StructuredResponseError, llm
 from app.tools.registry import registry
 from app.tools.research import research_tools
 from bs4 import BeautifulSoup
@@ -33,19 +36,11 @@ class Workflow:
 
     async def checkpoint(self):
         await self.session.refresh(self.job)
-        if self.job.status == "CANCELLED":
+        lease = await self.session.get(RunLease, self.job.id, populate_existing=True)
+        if self.job.status in {"CANCELLED", "FAILED"} or (lease and lease.expires_at <= now()):
             raise Stopped()
-        if self.job.cost >= self.job.budget:
+        if self.job.cost > self.job.budget:
             raise ValueError("Research budget exhausted")
-        organization = await self.session.get(Organization, self.job.organization_id)
-        used = (
-            await self.session.scalar(
-                select(func.sum(Research.cost)).where(Research.organization_id == self.job.organization_id)
-            )
-            or 0
-        )
-        if used >= organization.preferences.get("monthly_budget", settings().organization_budget):
-            raise ValueError("Organization budget exhausted")
 
     async def transition(self, expected: str, target: str):
         # Compare-and-swap prevents an in-flight worker from undoing cancellation.
@@ -91,13 +86,14 @@ class Workflow:
         context = json.dumps(data)
         if len(context) > config.max_context_chars:
             raise ValueError("Context limit exceeded")
-        # Reserve the configured maximum output before issuing a billable request.
-        reservation = (
-            len(context) * config.input_price_per_million + 4000 * config.output_price_per_million
-        ) / 1_000_000
-        if self.job.cost + reservation > self.job.budget:
-            raise ValueError("Insufficient budget for next model call")
         prompt = (PROMPTS / agent / "v1.txt").read_text(encoding="utf-8-sig")
+        # UTF-8 byte count is a conservative token estimate, including instructions,
+        # schema, and protocol overhead. Reservations are admission estimates, not invoices.
+        input_bound = len((prompt + context + json.dumps(schema.model_json_schema())).encode("utf-8")) + 1024
+        reservation = (
+            input_bound * config.input_price_per_million + 4000 * config.output_price_per_million
+        ) / 1_000_000
+        receipt = await reserve(self.session, self.job, reservation, "model")
         await self.event(
             agent,
             "agent_started",
@@ -109,9 +105,18 @@ class Workflow:
                 "logical_call_number": prior_calls + 1,
                 "provider": config.llm_provider,
                 "model": config.llm_model,
+                "reservation_id": receipt.id,
+                "reserved_cost": reservation,
             },
         )
-        result = await llm().complete(prompt, data, schema)
+        validation_error = None
+        try:
+            result = await llm().complete(prompt, data, schema)
+        except RequestRejected:
+            await settle(self.session, self.job, receipt, 0)
+            raise
+        except StructuredResponseError as exc:
+            result, validation_error = exc.receipt, exc
         cost = (
             result.input_tokens * config.input_price_per_million
             + result.output_tokens * config.output_price_per_million
@@ -129,8 +134,15 @@ class Workflow:
                 request_id=result.request_id,
             )
         )
-        self.job.cost += cost
-        await self.session.commit()
+        await settle(self.session, self.job, receipt, cost)
+        if validation_error:
+            await self.event(
+                agent,
+                "agent_response_rejected",
+                "Structured response failed validation; usage recorded",
+                {"reservation_id": receipt.id, "estimated_cost": cost},
+            )
+            raise validation_error
         await self.checkpoint()
         await self.event(
             agent,
@@ -195,13 +207,11 @@ class Workflow:
     async def collect_web(self, queries):
         query_limit = DEPTH_QUERY_LIMITS[self.job.depth]
         for query in queries[:query_limit]:
-            if self.job.cost + settings().search_price_per_call > self.job.budget:
-                raise ValueError("Insufficient search budget")
+            receipt = await reserve(self.session, self.job, settings().search_price_per_call, "search")
             await self.tool("web_search", {"query": query})
             results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
             results = list({result["url"]: result for result in results}.values())
-            self.job.cost += settings().search_price_per_call
-            await self.session.commit()
+            await settle(self.session, self.job, receipt, settings().search_price_per_call)
 
             # Network I/O is concurrent; evidence persistence remains serialized.
             async def fetch(result):
@@ -279,10 +289,7 @@ class Workflow:
         if routing.document_queries:
             await self.collect_documents(routing.document_queries)
         sources = list((await self.session.scalars(select(Source).where(Source.research_id == self.job.id))).all())
-        evidence = [
-            {"citation": source.citation, "title": source.title, "untrusted_evidence": source.evidence[:2000]}
-            for source in sources
-        ][:10]
+        evidence = pack_evidence(sources, self.job.question)
         if not evidence:
             raise ValueError("No retrievable evidence; upload indexed documents or check the search configuration")
         analysis = await self.generate("analyst", {"question": self.job.question, "evidence": evidence}, Analysis)
@@ -398,9 +405,12 @@ async def run_research(ctx, research_id: str, planning: bool = True):
         result = await session.execute(
             update(Research).where(Research.id == research_id, Research.status == expected).values(status=active)
         )
-        await session.commit()
         if not cast(CursorResult, result).rowcount:
+            await session.rollback()
             return
+        # Never replay an interrupted phase across an uncertain paid call.
+        await session.merge(RunLease(research_id=research_id, expires_at=now() + timedelta(seconds=720)))
+        await session.commit()
         job = await session.get(Research, research_id)
         if job is None:
             return
@@ -428,7 +438,7 @@ async def run_research(ctx, research_id: str, planning: bool = True):
                     await workflow.execute()
             await session.commit()
         except Stopped:
-            await workflow.event("manager", "research_cancelled", "Research cancelled")
+            await workflow.event("manager", "research_stopped", "Research stopped by cancellation or execution deadline")
         except Exception as exc:
             await session.rollback()
             await session.refresh(job)

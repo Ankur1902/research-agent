@@ -21,12 +21,41 @@ class Completion:
     http_attempts: int | None = None
 
 
+class StructuredResponseError(ValueError):
+    """A billable response failed validation; preserve its usage receipt."""
+
+    def __init__(self, receipt: Completion):
+        super().__init__("Provider returned an incomplete or invalid structured response")
+        self.receipt = receipt
+
+
+class RequestRejected(RuntimeError):
+    """The provider explicitly declined the request before generation."""
+
+
+class EmptyResponse(BaseModel):
+    pass
+
+
+def validated_completion(schema, content, input_tokens, output_tokens, start, request_id, attempts, *, complete=True):
+    receipt = Completion(
+        EmptyResponse(), input_tokens, output_tokens, int((time.monotonic() - start) * 1000), request_id, attempts
+    )
+    try:
+        if not complete:
+            raise ValueError("Incomplete response")
+        receipt.value = schema.model_validate_json(content)
+    except ValueError:
+        raise StructuredResponseError(receipt) from None
+    return receipt
+
+
 class LLMProvider(ABC):
     @abstractmethod
     async def complete(self, system: str, data: dict, schema: type[BaseModel]) -> Completion: ...
 
 
-async def request_json(url, headers, body):
+async def request_json(url, headers, body, *, retry_ambiguous=True):
     async with httpx.AsyncClient(timeout=90) as client:
         for attempt in range(MAX_PROVIDER_HTTP_ATTEMPTS):
             try:
@@ -39,7 +68,13 @@ async def request_json(url, headers, body):
                 return result
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in {429, 500, 502, 503, 504}:
-                    raise RuntimeError(f"Provider rejected request ({exc.response.status_code})") from None
+                    raise RequestRejected(f"Provider rejected request ({exc.response.status_code})") from None
+                # Generation timeouts and server errors can follow accepted,
+                # billable work. Retry only an explicit throttle response.
+                if not retry_ambiguous and (
+                    not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429
+                ):
+                    raise RuntimeError("Provider outcome uncertain; automatic replay disabled") from None
                 if attempt == MAX_PROVIDER_HTTP_ATTEMPTS - 1:
                     raise RuntimeError("Provider unavailable after bounded retries") from None
                 await asyncio.sleep(2**attempt)
@@ -50,7 +85,7 @@ class OpenAIProvider(LLMProvider):
     async def complete(self, system, data, schema):
         config = settings()
         if not config.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required for live OpenAI research")
+            raise RequestRejected("OPENAI_API_KEY is required for live OpenAI research")
         start = time.monotonic()
         result = await request_json(
             "https://api.openai.com/v1/chat/completions",
@@ -64,12 +99,14 @@ class OpenAIProvider(LLMProvider):
                     "json_schema": {"name": schema.__name__, "strict": True, "schema": schema.model_json_schema()},
                 },
             },
+            retry_ambiguous=False,
         )
-        return Completion(
-            schema.model_validate_json(result["choices"][0]["message"]["content"]),
+        return validated_completion(
+            schema,
+            result["choices"][0]["message"]["content"],
             result["usage"]["prompt_tokens"],
             result["usage"]["completion_tokens"],
-            int((time.monotonic() - start) * 1000),
+            start,
             result["id"],
             result.get("_researchos_http_attempts"),
         )
@@ -79,7 +116,7 @@ class AnthropicProvider(LLMProvider):
     async def complete(self, system, data, schema):
         config = settings()
         if not config.anthropic_api_key:
-            raise ValueError("ANTHROPIC_API_KEY is required")
+            raise RequestRejected("ANTHROPIC_API_KEY is required")
         start = time.monotonic()
         result = await request_json(
             "https://api.anthropic.com/v1/messages",
@@ -91,13 +128,15 @@ class AnthropicProvider(LLMProvider):
                 "messages": [{"role": "user", "content": json.dumps(data)}],
                 "output_config": {"format": {"type": "json_schema", "schema": schema.model_json_schema()}},
             },
+            retry_ambiguous=False,
         )
         content = "".join(block.get("text", "") for block in result["content"])
-        return Completion(
-            schema.model_validate_json(content),
+        return validated_completion(
+            schema,
+            content,
             result["usage"]["input_tokens"],
             result["usage"]["output_tokens"],
-            int((time.monotonic() - start) * 1000),
+            start,
             result["id"],
             result.get("_researchos_http_attempts"),
         )
@@ -135,7 +174,7 @@ class GeminiProvider(LLMProvider):
     async def complete(self, system, data, schema):
         config = settings()
         if not config.google_api_key:
-            raise ValueError("GOOGLE_API_KEY is required")
+            raise RequestRejected("GOOGLE_API_KEY is required")
         start = time.monotonic()
         result = await request_json(
             f"https://generativelanguage.googleapis.com/v1beta/models/{config.llm_model}:generateContent",
@@ -149,25 +188,25 @@ class GeminiProvider(LLMProvider):
                     "maxOutputTokens": 4000,
                 },
             },
+            retry_ambiguous=False,
         )
         candidates = result.get("candidates", [])
-        if not candidates or candidates[0].get("finishReason") not in {None, "STOP"}:
-            raise ValueError("Gemini did not return a complete structured response")
+        candidate = candidates[0] if candidates else {}
         content = "".join(
             part.get("text", "")
-            for part in candidates[0].get("content", {}).get("parts", [])
+            for part in candidate.get("content", {}).get("parts", [])
             if not part.get("thought", False)
         )
-        if not content:
-            raise ValueError("Gemini returned no structured text")
         usage = result.get("usageMetadata", {})
-        return Completion(
-            schema.model_validate_json(content),
+        return validated_completion(
+            schema,
+            content,
             usage.get("promptTokenCount", 0),
             usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
-            int((time.monotonic() - start) * 1000),
+            start,
             result.get("responseId", ""),
             result.get("_researchos_http_attempts"),
+            complete=bool(content) and candidate.get("finishReason") in {None, "STOP"},
         )
 
 
@@ -193,7 +232,10 @@ class TavilySearch(SearchProvider):
         if not config.search_api_key:
             raise ValueError("SEARCH_API_KEY is required for web research")
         result = await request_json(
-            "https://api.tavily.com/search", {}, {"api_key": config.search_api_key, "query": query, "max_results": 4}
+            "https://api.tavily.com/search",
+            {},
+            {"api_key": config.search_api_key, "query": query, "max_results": 4},
+            retry_ambiguous=False,
         )
         return [{"title": item["title"], "url": item["url"]} for item in result["results"]]
 

@@ -40,11 +40,13 @@ async def local_lifespan(application):
     application.state.redis = queue
     application.state.dummy_hash = hasher.hash("local-dummy-password")
     worker = asyncio.create_task(queue.worker())
+    recovery = asyncio.create_task(queue.recover())
     try:
         yield
     finally:
         worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        recovery.cancel()
+        await asyncio.gather(worker, recovery, return_exceptions=True)
         await engine.dispose()
 
 

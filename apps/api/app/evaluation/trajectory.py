@@ -75,11 +75,16 @@ def evaluate_trajectory(case: WorkflowCase, trace: SavedTrajectory) -> dict:
     )
     tools = [event for event in trace.events if event.type == "tool_called"]
     models = [event.agent for event in trace.events if event.type == "agent_started"]
-    # Production traces intentionally omit arguments. Argument contracts cannot pass without observations.
     checks.extend(
         evaluate_calls(
             case.expectations,
-            [(event.agent, None) for event in tools],
+            [
+                (
+                    event.agent,
+                    event.details.get("arguments") if isinstance(event.details.get("arguments"), dict) else None,
+                )
+                for event in tools
+            ],
             dict(Counter(models)),
             latency_ms=trace.latency_ms,
             total_tokens=trace.total_tokens,

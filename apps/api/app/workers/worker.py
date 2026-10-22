@@ -3,6 +3,8 @@ from app.core.config import settings
 from app.core.db import Session
 from app.models.entities import Document
 from app.rag.pipeline import index_document
+from app.workers.recovery import recover_research
+from arq import cron
 from arq.connections import RedisSettings
 
 
@@ -29,3 +31,5 @@ class WorkerSettings:
     max_jobs = 4
     job_timeout = 660
     max_tries = 2
+    on_startup = recover_research
+    cron_jobs = [cron(recover_research, second={0, 30}, unique=True)]

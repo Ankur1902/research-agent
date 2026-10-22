@@ -141,3 +141,31 @@ def test_tool_attempt_before_approval_and_wrong_case_fail():
     assert not result["gate_passed"]
     failures = {item["name"] for item in result["checks"] if not item["passed"]}
     assert {"case_identity", "execution_authorized_before_tools", "report_schema"} <= failures
+
+
+@pytest.mark.parametrize(
+    "arguments, passes", [({"query": "notice deadline"}, True), ({"query": "wrong"}, False), (None, False)]
+)
+def test_saved_trace_grades_observed_tool_arguments(arguments, passes):
+    case = workflow_cases()[2]
+    case.expectations.arguments = [
+        ArgumentExpectation(tool="document_search", occurrence=0, arguments_json='{"query":"notice deadline"}')
+    ]
+    trace = SavedTrajectory(
+        case_id=case.id,
+        final_status="REVIEW",
+        report=None,
+        events=[
+            SavedEvent(
+                sequence=1, agent="manager", type="execution_authorized", details={"previous_status": "APPROVED"}
+            ),
+            SavedEvent(
+                sequence=2,
+                agent="document_search",
+                type="tool_called",
+                details={"approval_verified": True, **({"arguments": arguments} if arguments is not None else {})},
+            ),
+        ],
+    )
+    checks = evaluate_trajectory(case, trace)["checks"]
+    assert next(item["passed"] for item in checks if item["name"] == "tool_arguments.document_search.0") is passes
