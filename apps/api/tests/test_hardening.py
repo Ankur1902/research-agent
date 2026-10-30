@@ -169,7 +169,11 @@ async def test_delete_document_is_tenant_scoped_and_audited(monkeypatch):
         assert "document_deleted" in (await session.scalars(select(Audit.action))).all()
 
 
-async def test_delete_fails_closed_when_vector_index_is_down():
+async def test_delete_fails_closed_when_vector_index_is_down(monkeypatch):
+    async def unavailable(document):
+        raise ConnectionError("qdrant down")
+
+    monkeypatch.setattr("app.api.routes.purge_document_vectors", unavailable)
     app.state.redis = FakeRedis()
     app.state.dummy_hash = hasher.hash("dummy-password")
     async with AsyncClient(
@@ -179,6 +183,6 @@ async def test_delete_fails_closed_when_vector_index_is_down():
         document_id = (await client.post("/api/v1/documents", files={"file": ("n.txt", b"Some text here.")})).json()[
             "id"
         ]
-        # Hybrid backend with no reachable Qdrant: rows must be kept so the delete can be retried.
+        # Injected outage (independent of whether a real Qdrant exists): rows must be kept for retry.
         assert (await client.delete(f"/api/v1/documents/{document_id}")).status_code == 503
         assert (await client.get(f"/api/v1/documents/{document_id}")).status_code == 200
