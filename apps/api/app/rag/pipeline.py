@@ -134,6 +134,31 @@ async def index_document(session, document: Document):
         await client.close()
 
 
+async def purge_document_vectors(document: Document):
+    """Remove every vector for a document; tenant and document filters are both required."""
+    if settings().retrieval_backend == "lexical":
+        return
+    client = AsyncQdrantClient(url=settings().qdrant_url)
+    try:
+        if not await client.collection_exists(settings().qdrant_collection):
+            return
+        await client.delete(
+            settings().qdrant_collection,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="organization_id", match=models.MatchValue(value=document.organization_id)
+                        ),
+                        models.FieldCondition(key="document_id", match=models.MatchValue(value=document.id)),
+                    ]
+                )
+            ),
+        )
+    finally:
+        await client.close()
+
+
 async def retrieve(session, organization_id, query):
     terms = list(dict.fromkeys(tokens(query)))[:16]
     if not terms:

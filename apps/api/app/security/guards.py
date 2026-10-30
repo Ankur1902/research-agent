@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import ipaddress
 import re
 import socket
-from urllib.parse import urlparse
+import unicodedata
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -12,14 +14,52 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+_INJECTION = re.compile(
+    r"(ignore|disregard|forget|override)\W+(all\W+|any\W+|the\W+|previous\W+|prior\W+|above\W+|your\W+)*"
+    r"(instructions|rules|guidelines|prompts?)"
+    r"|reveal.{0,40}(secret|environment|system prompt|credential|api key)"
+    r"|(send|post|exfiltrate).{0,40}(password|credential|token|api key)"
+    r"|delete all users",
+    re.I | re.S,
+)
+_INVISIBLE = dict.fromkeys([0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD])
+
+
 def detect_injection(text: str) -> bool:
-    return bool(
-        re.search(
-            r"ignore (all |previous |your )?instructions|reveal.*(secret|environment|prompt)|send.*password|delete all users",
-            text,
-            re.I,
-        )
-    )
+    """Heuristic only: NFKC and zero-width stripping defeat trivial obfuscation, not a determined attacker."""
+    return bool(_INJECTION.search(unicodedata.normalize("NFKC", text).translate(_INVISIBLE)))
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    re.compile(r"\btvly-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+)
+
+
+def redact_secrets(value):
+    """Recursively replace credential-shaped strings in model output before it is persisted."""
+    if isinstance(value, str):
+        for pattern in _SECRET_PATTERNS:
+            value = pattern.sub("[REDACTED]", value)
+        return value
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_secrets(item) for key, item in value.items()}
+    return value
+
+
+async def throttle(redis, key: str, limit: int, window: int = 60) -> bool:
+    """Fixed-window counter; True when the caller is still within the limit."""
+    bucket = f"rate:{key}"
+    count = await redis.incr(bucket)
+    if count == 1:
+        await redis.expire(bucket, window)
+    return count <= limit
 
 
 def public_url(url: str) -> tuple[str, str, int]:
@@ -39,7 +79,7 @@ async def fetch_public(url: str) -> str:
     # Connect to the validated IP, retaining the hostname for TLS and Host.
     # No proxy environment is trusted and each redirect is checked separately.
     for _ in range(4):
-        host, address, _port = public_url(url)
+        host, address, _port = await asyncio.to_thread(public_url, url)  # DNS must not block the event loop
         parsed = urlparse(url)
         netloc = f"[{address}]" if ":" in address else address
         pinned = parsed._replace(netloc=netloc).geturl()
@@ -51,9 +91,10 @@ async def fetch_public(url: str) -> str:
                 extensions={"sni_hostname": host},
             ) as response:
                 if response.is_redirect:
-                    from urllib.parse import urljoin
-
-                    url = urljoin(url, response.headers["location"])
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("Redirect without a destination")
+                    url = urljoin(url, location)
                     continue
                 response.raise_for_status()
                 if "text/" not in response.headers.get("content-type", ""):

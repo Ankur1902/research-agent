@@ -11,6 +11,7 @@ typecheck:
 	cd apps/web && npm run typecheck
 security:
 	python -m pytest apps/api/tests/test_security.py -q
+	python scripts/guardrail_eval.py
 build:
 	cd apps/web && npm run build
 up:

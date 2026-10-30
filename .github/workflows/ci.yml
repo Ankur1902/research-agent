@@ -12,6 +12,7 @@ jobs:
       - run: mypy apps/api/app
       - run: pytest -q
       - run: python scripts/evaluate.py
+      - run: python scripts/guardrail_eval.py
   frontend:
     runs-on: ubuntu-latest
     steps:

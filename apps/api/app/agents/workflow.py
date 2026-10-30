@@ -14,9 +14,9 @@ from app.core.db import Session
 from app.models.entities import Document, Event, Research, RunLease, Source, Usage, now
 from app.rag.pipeline import retrieve
 from app.schemas.contracts import Analysis, Assessment, Finding, Plan, Report
-from app.security.guards import detect_injection, digest
+from app.security.guards import detect_injection, digest, redact_secrets
 from app.services.budgets import reserve, settle
-from app.services.providers import RequestRejected, StructuredResponseError, llm
+from app.services.providers import ProviderUnavailable, RequestRejected, StructuredResponseError, llm
 from app.tools.registry import registry
 from app.tools.research import research_tools
 from bs4 import BeautifulSoup
@@ -90,9 +90,8 @@ class Workflow:
         # UTF-8 byte count is a conservative token estimate, including instructions,
         # schema, and protocol overhead. Reservations are admission estimates, not invoices.
         input_bound = len((prompt + context + json.dumps(schema.model_json_schema())).encode("utf-8")) + 1024
-        reservation = (
-            input_bound * config.input_price_per_million + 4000 * config.output_price_per_million
-        ) / 1_000_000
+        input_price, output_price = config.price_ceiling()  # cover whichever chain member ends up serving
+        reservation = (input_bound * input_price + 4000 * output_price) / 1_000_000
         receipt = await reserve(self.session, self.job, reservation, "model")
         await self.event(
             agent,
@@ -112,21 +111,21 @@ class Workflow:
         validation_error = None
         try:
             result = await llm().complete(prompt, data, schema)
-        except RequestRejected:
+        except (RequestRejected, ProviderUnavailable):
+            # Provably unprocessed (declined, unreachable, throttled, or every circuit open): release the hold.
             await settle(self.session, self.job, receipt, 0)
             raise
         except StructuredResponseError as exc:
             result, validation_error = exc.receipt, exc
-        cost = (
-            result.input_tokens * config.input_price_per_million
-            + result.output_tokens * config.output_price_per_million
-        ) / 1_000_000
+        provider, model = result.provider or config.llm_provider, result.model or config.llm_model
+        input_price, output_price = config.price_for(provider, model)
+        cost = (result.input_tokens * input_price + result.output_tokens * output_price) / 1_000_000
         self.session.add(
             Usage(
                 organization_id=self.job.organization_id,
                 research_id=self.job.id,
-                provider=config.llm_provider,
-                model=config.llm_model,
+                provider=provider,
+                model=model,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
                 cost=cost,
@@ -153,9 +152,10 @@ class Workflow:
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
                 "estimated_cost": cost,
-                "provider": config.llm_provider,
-                "model": config.llm_model,
+                "provider": provider,
+                "model": model,
                 "http_attempts": result.http_attempts,
+                **({"failover": result.failover} if result.failover else {}),
             },
         )
         return result.value
@@ -209,7 +209,12 @@ class Workflow:
         for query in queries[:query_limit]:
             receipt = await reserve(self.session, self.job, settings().search_price_per_call, "search")
             await self.tool("web_search", {"query": query})
-            results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
+            try:
+                results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
+            except (RequestRejected, ValueError):
+                # Declined before any search was performed: release the hold instead of leaking budget.
+                await settle(self.session, self.job, receipt, 0)
+                raise
             results = list({result["url"]: result for result in results}.values())
             await settle(self.session, self.job, receipt, settings().search_price_per_call)
 
@@ -263,7 +268,12 @@ class Workflow:
                     document.name,
                     f"document:{document.id}#page={chunk.page}",
                     chunk.text,
-                    {"page": chunk.page, "chunk_id": chunk.id, "type": "document"},
+                    {
+                        "page": chunk.page,
+                        "chunk_id": chunk.id,
+                        "type": "document",
+                        "suspicious_content": detect_injection(chunk.text),
+                    },
                 )
 
     async def plan(self):
@@ -293,6 +303,10 @@ class Workflow:
         if not evidence:
             raise ValueError("No retrievable evidence; upload indexed documents or check the search configuration")
         analysis = await self.generate("analyst", {"question": self.job.question, "evidence": evidence}, Analysis)
+        if any(item["possible_embedded_instructions"] for item in evidence):
+            analysis.limitations.append(
+                "Some sources contained instruction-like text; it was treated as data and never followed."
+            )
         by_citation = {source.citation: source for source in sources}
         for computation in analysis.computations:
             if len(analysis.findings) >= 30:
@@ -351,12 +365,15 @@ class Workflow:
             for index in section.finding_indices
         ):
             raise ValueError("Writer referenced an unknown finding")
-        self.job.report = {
-            **report.model_dump(),
-            "findings": [finding.model_dump() for finding in analysis.findings],
-            "sources": [{"citation": s.citation, "title": s.title, "url": s.url} for s in sources],
-            "mode": self.job.mode,
-        }
+        # Output guardrail: credential-shaped strings never reach storage or exports.
+        self.job.report = redact_secrets(
+            {
+                **report.model_dump(),
+                "findings": [finding.model_dump() for finding in analysis.findings],
+                "sources": [{"citation": s.citation, "title": s.title, "url": s.url} for s in sources],
+                "mode": self.job.mode,
+            }
+        )
         await self.transition("VERIFICATION", "REVIEW")
         await self.event("writer", "approval_required", "Evidence-backed draft ready for final review")
 
