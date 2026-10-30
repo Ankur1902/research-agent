@@ -1,9 +1,20 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PLACEHOLDER_SECRETS = ("replace-with", "change-me", "changeme")
+
+
+class FallbackTarget(BaseModel):
+    """A secondary model used when the primary is unreachable. Prices are mandatory so cost stays honest."""
+
+    model_config = ConfigDict(extra="forbid")
+    provider: Literal["openai", "anthropic", "gemini"]
+    model: str = Field(min_length=1, max_length=100)
+    input_price_per_million: float = Field(ge=0)
+    output_price_per_million: float = Field(ge=0)
 
 
 class Settings(BaseSettings):
@@ -33,6 +44,26 @@ class Settings(BaseSettings):
     max_steps: int = 12
     max_tool_calls: int = 24
     max_requests_per_minute: int = 120
+    # JSON list, e.g. [{"provider":"gemini","model":"...","input_price_per_million":0.3,"output_price_per_million":2.5}]
+    llm_fallbacks: list[FallbackTarget] = Field(default_factory=list, max_length=3)
+    breaker_failure_threshold: int = Field(default=3, ge=1)
+    breaker_cooldown_seconds: float = Field(default=60, gt=0)
+
+    def price_for(self, provider: str | None, model: str | None) -> tuple[float, float]:
+        """Per-million (input, output) price of the model that actually served a call."""
+        for target in self.llm_fallbacks:
+            if (target.provider, target.model) == (provider, model) and (provider, model) != (
+                self.llm_provider,
+                self.llm_model,
+            ):
+                return target.input_price_per_million, target.output_price_per_million
+        return self.input_price_per_million, self.output_price_per_million
+
+    def price_ceiling(self) -> tuple[float, float]:
+        """Worst-case prices across the chain, so reservations cover whichever model ends up serving."""
+        inputs = [self.input_price_per_million, *(t.input_price_per_million for t in self.llm_fallbacks)]
+        outputs = [self.output_price_per_million, *(t.output_price_per_million for t in self.llm_fallbacks)]
+        return max(inputs), max(outputs)
 
 
 def production_problems(config: Settings) -> list[str]:
