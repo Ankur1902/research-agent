@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # Proxies between the internet and the API that append the peer address to X-Forwarded-For. Keep 0 unless
     # an edge proxy you control sets it; otherwise clients can spoof their rate-limit identity.
     trusted_proxy_count: int = Field(default=0, ge=0, le=5)
+    # Opt-in tracing. "otlp" also honors the standard OTEL_EXPORTER_OTLP_* variables (endpoint, headers).
+    otel_traces_exporter: Literal["none", "console", "otlp"] = "none"
+    otel_service_name: str = "researchos-worker"
+    otel_sample_ratio: float = Field(default=1.0, ge=0, le=1)
     breaker_failure_threshold: int = Field(default=3, ge=1)
     breaker_cooldown_seconds: float = Field(default=60, gt=0)
 

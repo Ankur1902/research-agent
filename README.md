@@ -66,6 +66,7 @@ Optional seed: register an account, set `SEED_EMAIL` to it, and execute `scripts
 - [API](docs/API.md), generated OpenAPI at http://localhost:8000/docs
 - [Evaluation definitions](docs/EVALUATION.md)
 - [Security and remaining threats](docs/SECURITY.md)
+- [Tracing with OpenTelemetry](docs/OBSERVABILITY.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Verification results](docs/VERIFICATION.md)
 
