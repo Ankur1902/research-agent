@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import httpx
 from app.core.config import settings
+from app.core.telemetry import event
 from pydantic import BaseModel
 
 MAX_PROVIDER_HTTP_ATTEMPTS = 3
@@ -315,6 +316,7 @@ class FailoverProvider(LLMProvider):
             label, breaker = f"{name}:{model}", breaker_for(name, model)
             if not breaker.allow():
                 skipped.append(f"{label}:circuit_open")
+                event("failover.skip", {"target": label, "reason": "circuit_open"})
                 continue
             try:
                 completion = await PROVIDER_TYPES[name](model).complete(system, data, schema)
@@ -325,10 +327,12 @@ class FailoverProvider(LLMProvider):
             except RequestRejected as exc:
                 breaker.release()
                 skipped.append(f"{label}:rejected")
+                event("failover.skip", {"target": label, "reason": "rejected"})
                 last_error = exc
             except ProviderUnavailable as exc:
                 breaker.failure()
                 skipped.append(f"{label}:unavailable")
+                event("failover.skip", {"target": label, "reason": "unavailable", "breaker_state": breaker.state})
                 last_error = exc
             except OutcomeUncertain:
                 breaker.failure()

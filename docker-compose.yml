@@ -84,6 +84,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+  jaeger:
+    # Optional trace viewer: docker compose --profile observability up. See docs/OBSERVABILITY.md.
+    profiles: [observability]
+    image: jaegertracing/jaeger:2.22.0
+    ports: ["127.0.0.1:16686:16686"]
 volumes:
   mysql-data:
   redis-data:

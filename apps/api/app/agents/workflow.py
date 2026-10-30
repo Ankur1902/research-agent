@@ -11,6 +11,7 @@ from app.agents.design import DEPTH_QUERY_LIMITS, MODEL_STAGES, route_plan
 from app.agents.evidence import pack_evidence
 from app.core.config import settings
 from app.core.db import Session
+from app.core.telemetry import annotate, mark_failed, span, trace_ref
 from app.models.entities import Document, Event, Research, RunLease, Source, Usage, now
 from app.rag.pipeline import retrieve
 from app.schemas.contracts import Analysis, Assessment, Finding, Plan, Report
@@ -23,6 +24,10 @@ from bs4 import BeautifulSoup
 from sqlalchemy import CursorResult, func, select, update
 
 PROMPTS = Path(__file__).resolve().parents[4] / "packages" / "prompts"
+
+
+# OpenTelemetry GenAI semantic-convention provider names.
+GEN_AI_PROVIDER = {"openai": "openai", "anthropic": "anthropic", "gemini": "gcp.gemini"}
 
 
 class Stopped(Exception):
@@ -71,6 +76,11 @@ class Workflow:
         await self.session.commit()
 
     async def generate(self, agent, data, schema):
+        attributes = {"gen_ai.operation.name": "chat", "researchos.agent": agent, "researchos.research_id": self.job.id}
+        with span(f"agent.{agent}", attributes):
+            return await self._generate(agent, data, schema)
+
+    async def _generate(self, agent, data, schema):
         await self.checkpoint()
         if agent not in MODEL_STAGES:
             raise ValueError("Unknown model stage")
@@ -93,6 +103,14 @@ class Workflow:
         input_price, output_price = config.price_ceiling()  # cover whichever chain member ends up serving
         reservation = (input_bound * input_price + 4000 * output_price) / 1_000_000
         receipt = await reserve(self.session, self.job, reservation, "model")
+        annotate(
+            {
+                "researchos.prompt_sha256": digest(prompt),
+                "researchos.logical_call_number": prior_calls + 1,
+                "researchos.reserved_usd": reservation,
+                "gen_ai.request.model": config.llm_model,
+            }
+        )
         await self.event(
             agent,
             "agent_started",
@@ -120,6 +138,19 @@ class Workflow:
         provider, model = result.provider or config.llm_provider, result.model or config.llm_model
         input_price, output_price = config.price_for(provider, model)
         cost = (result.input_tokens * input_price + result.output_tokens * output_price) / 1_000_000
+        annotate(
+            {
+                "gen_ai.provider.name": GEN_AI_PROVIDER.get(provider, provider),
+                "gen_ai.response.model": model,
+                "gen_ai.response.id": result.request_id,
+                "gen_ai.usage.input_tokens": result.input_tokens,
+                "gen_ai.usage.output_tokens": result.output_tokens,
+                "researchos.cost.estimated_usd": cost,
+                "researchos.latency_ms": result.latency_ms,
+                "researchos.http_attempts": result.http_attempts,
+                "researchos.failover_skipped": len(result.failover or []),
+            }
+        )
         self.session.add(
             Usage(
                 organization_id=self.job.organization_id,
@@ -210,7 +241,11 @@ class Workflow:
             receipt = await reserve(self.session, self.job, settings().search_price_per_call, "search")
             await self.tool("web_search", {"query": query})
             try:
-                results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
+                with span("tool.web_search", {"researchos.tool.call_number": self.job.tool_calls}):
+                    results = (
+                        await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True)
+                    )[:4]
+                    annotate({"researchos.result_count": len(results)})
             except (RequestRejected, ValueError):
                 # Declined before any search was performed: release the hold instead of leaking budget.
                 await settle(self.session, self.job, receipt, 0)
@@ -221,9 +256,11 @@ class Workflow:
             # Network I/O is concurrent; evidence persistence remains serialized.
             async def fetch(result):
                 try:
-                    page = await self.tools.call(
-                        "fetch_webpage", {"url": result["url"]}, role="RESEARCHER", approved=True
-                    )
+                    with span("tool.fetch_webpage"):
+                        page = await self.tools.call(
+                            "fetch_webpage", {"url": result["url"]}, role="RESEARCHER", approved=True
+                        )
+                        annotate({"researchos.response_chars": len(page)})
                     soup = BeautifulSoup(page, "html.parser")
                     for tag in soup(["script", "style", "nav", "footer"]):
                         tag.decompose()
@@ -259,7 +296,9 @@ class Workflow:
     async def collect_documents(self, queries):
         for query in queries:
             await self.tool("document_search", {"query": query})
-            chunks = await self.tools.call("document_search", {"query": query}, role="RESEARCHER", approved=True)
+            with span("tool.document_search"):
+                chunks = await self.tools.call("document_search", {"query": query}, role="RESEARCHER", approved=True)
+                annotate({"researchos.result_count": len(chunks)})
             for chunk in chunks:
                 document = await self.session.get(Document, chunk.document_id)
                 if document is None or document.organization_id != self.job.organization_id:
@@ -295,9 +334,11 @@ class Workflow:
         plan = Plan.model_validate(self.job.plan)
         routing = route_plan(plan, self.job.source_mode, self.job.depth)
         if routing.web_queries:
-            await self.collect_web(routing.web_queries)
+            with span("research.collect_web", {"researchos.query_count": len(routing.web_queries)}):
+                await self.collect_web(routing.web_queries)
         if routing.document_queries:
-            await self.collect_documents(routing.document_queries)
+            with span("research.collect_documents", {"researchos.query_count": len(routing.document_queries)}):
+                await self.collect_documents(routing.document_queries)
         sources = list((await self.session.scalars(select(Source).where(Source.research_id == self.job.id))).all())
         evidence = pack_evidence(sources, self.job.question)
         if not evidence:
@@ -327,9 +368,10 @@ class Workflow:
                 )
                 continue
             await self.tool("calculator", {"operation": computation.operation, "values": computation.values})
-            result = await registry.call(
-                "calculator", {"operation": computation.operation, "values": computation.values}, role="RESEARCHER"
-            )
+            with span("tool.calculator", {"researchos.operation": computation.operation}):
+                result = await registry.call(
+                    "calculator", {"operation": computation.operation, "values": computation.values}, role="RESEARCHER"
+                )
             analysis.findings.append(
                 Finding(
                     text=f"Computed {computation.operation} from quoted values {computation.values}: {result['result']:g}. Units and source definitions require review.",
@@ -417,6 +459,12 @@ class Workflow:
 
 
 async def run_research(ctx, research_id: str, planning: bool = True):
+    phase = "planning" if planning else "execution"
+    with span("research.run", {"researchos.research_id": research_id, "researchos.phase": phase}):
+        await _run_research(research_id, planning)
+
+
+async def _run_research(research_id: str, planning: bool):
     async with Session() as session:
         expected, active = ("QUEUED", "PLANNING") if planning else ("APPROVED", "RUNNING")
         result = await session.execute(
@@ -432,6 +480,14 @@ async def run_research(ctx, research_id: str, planning: bool = True):
         if job is None:
             return
         workflow = Workflow(session, job)
+        annotate(
+            {
+                "researchos.organization_id": job.organization_id,
+                "researchos.mode": job.mode,
+                "researchos.depth": job.depth,
+                "researchos.source_mode": job.source_mode,
+            }
+        )
         try:
             async with asyncio.timeout(600):
                 if not planning:
@@ -443,10 +499,11 @@ async def run_research(ctx, research_id: str, planning: bool = True):
                             "previous_status": "APPROVED",
                             "mode": job.mode,
                             "retrieval_backend": settings().retrieval_backend,
+                            **trace_ref(),
                         },
                     )
                 else:
-                    await workflow.event("manager", "planning_started", "Research planning started")
+                    await workflow.event("manager", "planning_started", "Research planning started", trace_ref() or None)
                 if job.mode == "DEMO":
                     await workflow.demo(planning)
                 elif planning:
@@ -454,9 +511,13 @@ async def run_research(ctx, research_id: str, planning: bool = True):
                 else:
                     await workflow.execute()
             await session.commit()
+            annotate({"researchos.status_after": job.status})
         except Stopped:
+            annotate({"researchos.outcome": "stopped"})
             await workflow.event("manager", "research_stopped", "Research stopped by cancellation or execution deadline")
         except Exception as exc:
+            mark_failed(exc)
+            annotate({"researchos.outcome": "failed"})
             await session.rollback()
             await session.refresh(job)
             if job.status != "CANCELLED":
