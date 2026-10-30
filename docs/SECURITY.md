@@ -29,7 +29,9 @@ sequenceDiagram
 
 ## Remaining risks and deployment requirements
 
-**Client IPs in the default Compose topology.** Next's rewrite proxy forwards requests without adding `X-Forwarded-For`, so the API sees the web container as the peer for every user and the per-IP limits are shared by all of them. Per-account login throttling still applies. Put an edge proxy that appends the client address in front of the web container, then set `TRUSTED_PROXY_COUNT=1`. Do not set it without one.
+**Client identity and the edge proxy.** Next's rewrite proxy adds no `X-Forwarded-For` and passes a client-supplied one through unchanged (checked against the production build), so the API cannot trust it directly. Compose therefore puts a Caddy edge proxy (`docker/Caddyfile`) in front of the web container. With no `trusted_proxies`, Caddy treats clients as untrusted and sets the header itself, and the API trusts exactly one hop (`TRUSTED_PROXY_COUNT=1`, set in `docker-compose.yml` for the API only). The web container is no longer published to the host. The API is still published on `127.0.0.1:8000` for OpenAPI; a request sent straight to it can spoof the header, so do not publish it beyond loopback. If you run your own proxy chain, set the count to the number of proxies that append the client address. A wrong value lets clients choose their rate-limit identity.
+
+The Caddyfile could not be executed in the authoring environment. CI validates it with the official image and checks, through the edge, that the CSP header is present, the `Server` header is absent, and rotating `X-Forwarded-For` values still hits the rate limit.
 
 **CSP scope.** The CSP was verified in headless Chromium on the public pages (no violations, hydration intact, fresh nonce per request). Signed-in pages were not exercised without a running API; the Playwright job in CI is the check for those. Every page now renders dynamically, which nonces require.
 

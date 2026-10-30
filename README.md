@@ -23,7 +23,9 @@ Research requires more than a conversational answer. This project makes the plan
 
 ```mermaid
 flowchart LR
- UI[Next.js / React] --> API[FastAPI]
+ Browser --> Edge[Caddy edge proxy]
+ Edge --> UI[Next.js / React]
+ UI --> API[FastAPI]
  API --> MySQL
  API --> Redis
  Redis --> Worker[ARQ agents]

@@ -1,0 +1,26 @@
+{
+	# Nothing reconfigures the edge at runtime, so expose no admin listener.
+	admin off
+}
+
+# ":80" for local use. For a real deployment set SITE_ADDRESS to your domain and Caddy provisions HTTPS itself.
+{$SITE_ADDRESS::80} {
+	# Slightly above MAX_UPLOAD_BYTES (10 MB) to allow multipart framing; the API enforces the exact limit.
+	request_body {
+		max_size 12MB
+	}
+	header -Server
+
+	handle /_edge/health {
+		respond "ok" 200
+	}
+
+	# Clients are untrusted here (no trusted_proxies), so Caddy sets X-Forwarded-For to the real peer address
+	# instead of passing a client-supplied value through. The API reads it with TRUSTED_PROXY_COUNT=1.
+	handle {
+		reverse_proxy web:3000 {
+			# Server-sent events must not be buffered.
+			flush_interval -1
+		}
+	}
+}

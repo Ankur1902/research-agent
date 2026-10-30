@@ -30,10 +30,21 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: '22'}
       - run: cp .env.example .env
+      - name: Validate edge proxy config
+        run: docker run --rm -e SITE_ADDRESS=:80 -v "$PWD/docker/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile
       - run: docker compose up -d --build --wait
       - run: docker compose run --rm --no-deps -e QDRANT_INTEGRATION=1 api python -m pytest -q apps/api/tests
       - run: npm ci && npx playwright install --with-deps chromium && npm run test:e2e
         working-directory: apps/web
+      - name: Edge proxy checks
+        run: |
+          set -e
+          curl -fsS -D - -o /dev/null http://localhost:3000/login | grep -qi '^content-security-policy:'
+          if curl -fsSI http://localhost:3000/login | grep -qi '^server:'; then echo "Server header leaked"; exit 1; fi
+          # Rotating a client-supplied X-Forwarded-For must not mint fresh rate-limit buckets.
+          codes=$(for i in $(seq 1 300); do curl -s -o /dev/null -w '%{http_code}\n' -H "X-Forwarded-For: 198.51.100.$((i % 250 + 1))" http://localhost:3000/api/v1/auth/me; done)
+          echo "$codes" | sort | uniq -c
+          echo "$codes" | grep -q '^429$'
       - if: failure()
         run: docker compose logs
       - if: always()
