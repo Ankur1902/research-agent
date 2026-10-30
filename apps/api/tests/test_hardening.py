@@ -214,15 +214,24 @@ def test_client_ip_trusts_only_the_configured_proxy_chain(monkeypatch, hops, pee
     assert client_ip(FakeRequest(peer, forwarded)) == expected
 
 
-async def test_spoofed_forwarded_header_cannot_dodge_the_global_limit(monkeypatch):
+@pytest.mark.parametrize(
+    "hops, header",
+    [
+        (0, "9.9.9.{i}"),  # header ignored entirely
+        (1, "6.6.6.{i}, 203.0.113.7"),  # shipped topology: only the entry the edge proxy appended counts
+    ],
+)
+async def test_spoofed_forwarded_header_cannot_dodge_the_global_limit(monkeypatch, hops, header):
+    # Pin both settings: the container test run inherits TRUSTED_PROXY_COUNT=1 from docker-compose.yml.
+    monkeypatch.setattr(settings(), "trusted_proxy_count", hops)
     monkeypatch.setattr(settings(), "max_requests_per_minute", 3)
     app.state.redis = FakeRedis()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         codes = [
-            (await client.get("/api/v1/auth/me", headers={"x-forwarded-for": f"9.9.9.{i}"})).status_code
+            (await client.get("/api/v1/auth/me", headers={"x-forwarded-for": header.format(i=i)})).status_code
             for i in range(5)
         ]
-    assert codes[3:] == [429, 429]  # rotating the header does not mint fresh buckets by default
+    assert codes[3:] == [429, 429]  # rotating spoofed values does not mint fresh buckets
 
 
 async def test_api_responses_carry_a_locked_down_csp():
