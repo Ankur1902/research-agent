@@ -29,7 +29,7 @@ from app.rag.pipeline import chunk_text, parse_document, purge_document_vectors
 from app.repositories.tenant import owned, serialize
 from app.schemas.contracts import Credentials, Preferences, ProjectInput, Register, ResearchInput
 from app.security.auth import hasher, issue_session, principal, verify_password
-from app.security.guards import digest, require_role, throttle
+from app.security.guards import client_ip, digest, require_role, throttle
 from app.services.reports import export_pdf, markdown
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
@@ -63,7 +63,7 @@ async def enqueue(request, name, resource_id, **kwargs):
 
 async def limit_auth(request: Request, scope: str, email: str, per_ip: int, per_account: int):
     """Tight brute-force/abuse limits on top of the global per-IP admission control."""
-    client = digest(request.client.host if request.client else "unknown")
+    client = digest(client_ip(request))
     redis = request.app.state.redis
     if not await throttle(redis, f"auth:{scope}:ip:{client}", per_ip) or not await throttle(
         redis, f"auth:{scope}:acct:{digest(email.lower())}", per_account

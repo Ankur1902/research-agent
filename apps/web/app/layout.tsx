@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
 import { Providers } from "@/components/providers";
 import "./globals.css";
+
+// Nonce-based CSP needs a fresh nonce per request, so pages must render dynamically.
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   title: "ResearchOS — Evidence over intuition",
   description:
