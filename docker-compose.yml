@@ -43,6 +43,9 @@ services:
   api:
     build: {context: ., dockerfile: docker/api.Dockerfile}
     env_file: .env
+    # Coupled to this topology: exactly one trusted proxy (edge) sets X-Forwarded-For. Do not move this to .env.
+    environment:
+      TRUSTED_PROXY_COUNT: "1"
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -63,10 +66,26 @@ services:
       qdrant: {condition: service_started}
   web:
     build: {context: ., dockerfile: docker/web.Dockerfile}
-    ports: ["127.0.0.1:3000:3000"]
+    # Not published: browsers reach it only through the edge proxy, which owns client identity.
     depends_on:
       api: {condition: service_healthy}
+  edge:
+    image: caddy:2.8-alpine
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports: ["127.0.0.1:3000:80"]
+    depends_on: [web]
+    healthcheck:
+      # Local HTTP mode. With a real domain Caddy redirects :80 to HTTPS, so point this at https instead.
+      test: [CMD, wget, -q, --spider, "http://127.0.0.1:80/_edge/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 volumes:
   mysql-data:
   redis-data:
   qdrant-data:
+  caddy-data:
