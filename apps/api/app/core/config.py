@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PLACEHOLDER_SECRETS = ("replace-with", "change-me", "changeme")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -31,6 +33,20 @@ class Settings(BaseSettings):
     max_steps: int = 12
     max_tool_calls: int = 24
     max_requests_per_minute: int = 120
+
+
+def production_problems(config: Settings) -> list[str]:
+    """Configuration that must never reach a production deployment."""
+    if config.environment != "production":
+        return []
+    problems = []
+    if len(config.auth_secret) < 32 or any(marker in config.auth_secret.lower() for marker in PLACEHOLDER_SECRETS):
+        problems.append("AUTH_SECRET must be a random value of at least 32 characters")
+    if not config.public_origin.startswith("https://"):
+        problems.append("PUBLIC_ORIGIN must use https")
+    if any(marker in config.database_url.lower() for marker in ("researchos:researchos@", "change-me")):
+        problems.append("DATABASE_URL uses a default credential")
+    return problems
 
 
 @lru_cache
