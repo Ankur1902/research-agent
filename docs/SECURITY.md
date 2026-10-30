@@ -12,6 +12,8 @@ Tenants, submitted questions, uploaded files, retrieved pages and LLM output are
 - External evidence is labeled untrusted. Versioned prompts, validated Pydantic outputs, citation IDs checked against persisted sources, supporting quote checks, suspicious instruction detection and bounded tools.
 - Upload type, byte-size, PDF signature, page-count and extracted-text limits. No executable files persisted; client filenames never become paths. Scanned PDFs fail clearly without silently inventing text.
 - Same-origin frontend proxy; no API credentials sent to clients. React text escaping and escaped report HTML/PDF text. JSON logs exclude request bodies and credentials.
+- Browser hardening: a per-request nonce Content-Security-Policy with `strict-dynamic` (`apps/web/proxy.ts`), HSTS, `Permissions-Policy`, `frame-ancestors 'none'` and COOP. API responses carry `default-src 'none'; sandbox`, so even the HTML export cannot run script.
+- Per-account and per-IP throttling on login and registration. Client identity comes from `X-Forwarded-For` only through `TRUSTED_PROXY_COUNT` trusted proxies, counting from the right, so spoofed left-hand entries are ignored.
 - Redis rate limits, agent step / context / tool limits, per-research spending ceilings and organization recorded-cost ceiling. Docker internal services are not published to host ports.
 
 ```mermaid
@@ -27,7 +29,11 @@ sequenceDiagram
 
 ## Remaining risks and deployment requirements
 
-This is a portfolio implementation, not a completed enterprise security certification. Add managed TLS, HSTS/CSP policy tuned to Next.js, secret rotation, MFA/SSO, delivered password recovery and email verification, malware scanning, backups, dependency scans and external penetration testing before public production exposure. The current parser runs in a thread within the API; hostile PDFs require process/container isolation. Lexical retrieval is capped at 10,000 chunks; use a scalable tenant-filtered lexical index at larger scale. Generation pricing is configured rather than fetched from vendor billing.
+**Client IPs in the default Compose topology.** Next's rewrite proxy forwards requests without adding `X-Forwarded-For`, so the API sees the web container as the peer for every user and the per-IP limits are shared by all of them. Per-account login throttling still applies. Put an edge proxy that appends the client address in front of the web container, then set `TRUSTED_PROXY_COUNT=1`. Do not set it without one.
+
+**CSP scope.** The CSP was verified in headless Chromium on the public pages (no violations, hydration intact, fresh nonce per request). Signed-in pages were not exercised without a running API; the Playwright job in CI is the check for those. Every page now renders dynamically, which nonces require.
+
+This is a portfolio implementation, not a completed enterprise security certification. Add managed TLS, secret rotation, MFA/SSO, delivered password recovery and email verification, malware scanning, backups, dependency scans and external penetration testing before public production exposure. The current parser runs in a thread within the API; hostile PDFs require process/container isolation. Lexical retrieval is capped at 10,000 chunks; use a scalable tenant-filtered lexical index at larger scale. Generation pricing is configured rather than fetched from vendor billing.
 
 Organization ceilings apply to cumulative recorded costs and are not atomic cross-job reservations; concurrent provider calls can overshoot. Task-level preflight reserves configured output capacity but tokenization is conservative approximation. Add transactional organization reservations and separate search/embedding ledgers before paid multi-tenant deployment. Budget exhaustion does not interrupt an in-flight provider call. Cancellation is cooperative; it stops at the next checkpoint.
 

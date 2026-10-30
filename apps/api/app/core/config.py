@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     max_requests_per_minute: int = 120
     # JSON list, e.g. [{"provider":"gemini","model":"...","input_price_per_million":0.3,"output_price_per_million":2.5}]
     llm_fallbacks: list[FallbackTarget] = Field(default_factory=list, max_length=3)
+    # Proxies between the internet and the API that append the peer address to X-Forwarded-For. Keep 0 unless
+    # an edge proxy you control sets it; otherwise clients can spoof their rate-limit identity.
+    trusted_proxy_count: int = Field(default=0, ge=0, le=5)
     breaker_failure_threshold: int = Field(default=3, ge=1)
     breaker_cooldown_seconds: float = Field(default=60, gt=0)
 

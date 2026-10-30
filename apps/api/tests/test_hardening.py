@@ -186,3 +186,47 @@ async def test_delete_fails_closed_when_vector_index_is_down(monkeypatch):
         # Injected outage (independent of whether a real Qdrant exists): rows must be kept for retry.
         assert (await client.delete(f"/api/v1/documents/{document_id}")).status_code == 503
         assert (await client.get(f"/api/v1/documents/{document_id}")).status_code == 200
+
+
+class FakeRequest:
+    def __init__(self, peer, forwarded=None):
+        self.client = type("Peer", (), {"host": peer})() if peer else None
+        self.headers = {"x-forwarded-for": forwarded} if forwarded is not None else {}
+
+
+@pytest.mark.parametrize(
+    "hops, peer, forwarded, expected",
+    [
+        (0, "10.0.0.9", "1.2.3.4", "10.0.0.9"),  # default: header is ignored entirely
+        (1, "10.0.0.9", "6.6.6.6, 203.0.113.7", "203.0.113.7"),  # client-supplied left entry is ignored
+        (2, "10.0.0.9", "203.0.113.7, 198.51.100.2", "203.0.113.7"),
+        (1, "10.0.0.9", None, "10.0.0.9"),  # proxy configured but header missing
+        (2, "10.0.0.9", "203.0.113.7", "10.0.0.9"),  # fewer entries than trusted hops
+        (1, "10.0.0.9", "not-an-ip", "10.0.0.9"),  # garbage never becomes an identity
+        (1, "10.0.0.9", "2001:db8::1", "2001:db8::1"),
+        (0, None, None, "unknown"),
+    ],
+)
+def test_client_ip_trusts_only_the_configured_proxy_chain(monkeypatch, hops, peer, forwarded, expected):
+    from app.security.guards import client_ip
+
+    monkeypatch.setattr(settings(), "trusted_proxy_count", hops)
+    assert client_ip(FakeRequest(peer, forwarded)) == expected
+
+
+async def test_spoofed_forwarded_header_cannot_dodge_the_global_limit(monkeypatch):
+    monkeypatch.setattr(settings(), "max_requests_per_minute", 3)
+    app.state.redis = FakeRedis()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        codes = [
+            (await client.get("/api/v1/auth/me", headers={"x-forwarded-for": f"9.9.9.{i}"})).status_code
+            for i in range(5)
+        ]
+    assert codes[3:] == [429, 429]  # rotating the header does not mint fresh buckets by default
+
+
+async def test_api_responses_carry_a_locked_down_csp():
+    app.state.redis = FakeRedis()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/auth/me")
+    assert response.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'; sandbox"

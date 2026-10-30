@@ -10,6 +10,27 @@ import httpx
 from fastapi import HTTPException
 
 
+def client_ip(request) -> str:
+    """Rate-limit identity. X-Forwarded-For is trusted only through TRUSTED_PROXY_COUNT proxies.
+
+    Each trusted proxy appends the address of its peer, so the real client is the Nth entry from
+    the right; anything a client put further left is ignored.
+    """
+    from app.core.config import settings
+
+    peer = request.client.host if request.client else "unknown"
+    hops = settings().trusted_proxy_count
+    if hops <= 0:
+        return peer
+    forwarded = [part.strip() for part in request.headers.get("x-forwarded-for", "").split(",") if part.strip()]
+    if len(forwarded) < hops:
+        return peer
+    try:
+        return str(ipaddress.ip_address(forwarded[-hops]))
+    except ValueError:
+        return peer
+
+
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 

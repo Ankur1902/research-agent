@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.routes import router
 from app.core.config import production_problems, settings
 from app.security.auth import hasher
+from app.security.guards import client_ip, digest
 
 logger = logging.getLogger("researchos")
 logging.basicConfig(level=logging.INFO)
@@ -46,9 +47,7 @@ async def security_headers(request: Request, call_next):
         if request.url.path.startswith("/api/"):
             # Apply admission control before authentication. Client-controlled cookies
             # must never create fresh buckets (nor trust unconfigured proxy headers).
-            key = request.client.host if request.client else "unknown"
-            from app.security.guards import digest
-
+            key = client_ip(request)
             limit_key = f"rate:client:{digest(key)}"
             count = await request.app.state.redis.incr(limit_key)
             if count == 1:
@@ -68,6 +67,9 @@ async def security_headers(request: Request, call_next):
             "Cache-Control": "no-store",
         }
     )
+    if request.url.path.startswith("/api/"):
+        # API responses are data, never pages: even the HTML export must not run script if opened inline.
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; sandbox"
     logger.info(json.dumps({"request_id": request_id, "path": request.url.path, "status": response.status_code}))
     return response
 
