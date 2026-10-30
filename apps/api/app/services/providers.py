@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -19,6 +20,9 @@ class Completion:
     latency_ms: int
     request_id: str
     http_attempts: int | None = None
+    provider: str | None = None  # set when a failover chain chose the serving model
+    model: str | None = None
+    failover: list[str] | None = None  # skipped targets, "provider:model:reason"
 
 
 class StructuredResponseError(ValueError):
@@ -31,6 +35,14 @@ class StructuredResponseError(ValueError):
 
 class RequestRejected(RuntimeError):
     """The provider explicitly declined the request before generation."""
+
+
+class ProviderUnavailable(RuntimeError):
+    """The request was provably not processed (never sent, or throttled): safe to try another provider."""
+
+
+class OutcomeUncertain(RuntimeError):
+    """The provider may have accepted and billed the work: never replay it, here or on another provider."""
 
 
 class EmptyResponse(BaseModel):
@@ -51,13 +63,28 @@ def validated_completion(schema, content, input_tokens, output_tokens, start, re
 
 
 class LLMProvider(ABC):
+    def __init__(self, model: str | None = None):
+        self.model = model or settings().llm_model
+
     @abstractmethod
     async def complete(self, system: str, data: dict, schema: type[BaseModel]) -> Completion: ...
+
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
+
+
+def retry_delay(attempt: int, response: httpx.Response | None) -> float:
+    """Honor Retry-After (capped) else exponential backoff with jitter."""
+    header = response.headers.get("retry-after", "") if response is not None else ""
+    if header.isdigit():
+        return min(float(header), 30.0)
+    return 2**attempt + random.uniform(0, 0.5)
 
 
 async def request_json(url, headers, body, *, retry_ambiguous=True):
     async with httpx.AsyncClient(timeout=90) as client:
         for attempt in range(MAX_PROVIDER_HTTP_ATTEMPTS):
+            last = attempt == MAX_PROVIDER_HTTP_ATTEMPTS - 1
             try:
                 response = await client.post(url, headers=headers, json=body)
                 response.raise_for_status()
@@ -66,18 +93,26 @@ async def request_json(url, headers, body, *, retry_ambiguous=True):
                     raise RuntimeError("Provider returned an invalid JSON envelope")
                 result["_researchos_http_attempts"] = attempt + 1
                 return result
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # The request never reached the provider, so replay cannot double-bill.
+                if last:
+                    raise ProviderUnavailable("Provider unreachable after bounded retries") from None
+                await asyncio.sleep(retry_delay(attempt, None))
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in {429, 500, 502, 503, 504}:
-                    raise RequestRejected(f"Provider rejected request ({exc.response.status_code})") from None
+                failed = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+                if failed is not None and failed.status_code not in RETRYABLE_STATUS:
+                    raise RequestRejected(f"Provider rejected request ({failed.status_code})") from None
                 # Generation timeouts and server errors can follow accepted,
                 # billable work. Retry only an explicit throttle response.
-                if not retry_ambiguous and (
-                    not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429
-                ):
-                    raise RuntimeError("Provider outcome uncertain; automatic replay disabled") from None
-                if attempt == MAX_PROVIDER_HTTP_ATTEMPTS - 1:
-                    raise RuntimeError("Provider unavailable after bounded retries") from None
-                await asyncio.sleep(2**attempt)
+                if not retry_ambiguous and (failed is None or failed.status_code != 429):
+                    raise OutcomeUncertain("Provider outcome uncertain; automatic replay disabled") from None
+                if last:
+                    raise ProviderUnavailable("Provider unavailable after bounded retries") from None
+                await asyncio.sleep(retry_delay(attempt, failed))
+            except httpx.RequestError:
+                raise OutcomeUncertain("Provider connection failed") from None
+            except ValueError:
+                raise OutcomeUncertain("Provider returned a non-JSON response") from None
     raise RuntimeError("Provider request failed")
 
 
@@ -91,7 +126,7 @@ class OpenAIProvider(LLMProvider):
             "https://api.openai.com/v1/chat/completions",
             {"Authorization": f"Bearer {config.openai_api_key}"},
             {
-                "model": config.llm_model,
+                "model": self.model,
                 "max_completion_tokens": 4000,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(data)}],
                 "response_format": {
@@ -122,7 +157,7 @@ class AnthropicProvider(LLMProvider):
             "https://api.anthropic.com/v1/messages",
             {"x-api-key": config.anthropic_api_key, "anthropic-version": "2023-06-01"},
             {
-                "model": config.llm_model,
+                "model": self.model,
                 "max_tokens": 4000,
                 "system": system,
                 "messages": [{"role": "user", "content": json.dumps(data)}],
@@ -177,7 +212,7 @@ class GeminiProvider(LLMProvider):
             raise RequestRejected("GOOGLE_API_KEY is required")
         start = time.monotonic()
         result = await request_json(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{config.llm_model}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
             {"x-goog-api-key": config.google_api_key},
             {
                 "systemInstruction": {"parts": [{"text": system}]},
@@ -210,15 +245,118 @@ class GeminiProvider(LLMProvider):
         )
 
 
+PROVIDER_TYPES: dict[str, type[LLMProvider]] = {
+    "openai": OpenAIProvider,
+    "anthropic": AnthropicProvider,
+    "gemini": GeminiProvider,
+}
+
+
+class CircuitBreaker:
+    """closed -> open after N consecutive failures -> half-open probe after a cooldown.
+
+    Process-local: each worker learns provider health independently. All methods are
+    synchronous, so under asyncio no lock is needed.
+    """
+
+    def __init__(self, threshold: int = 3, cooldown: float = 60.0, clock=time.monotonic):
+        self.threshold, self.cooldown, self.clock = threshold, cooldown, clock
+        self.state, self.failures, self.opened_at, self.probing = "closed", 0, 0.0, False
+
+    def allow(self) -> bool:
+        if self.state == "open" and self.clock() - self.opened_at >= self.cooldown:
+            self.state = "half_open"
+        if self.state == "closed":
+            return True
+        if self.state == "half_open" and not self.probing:
+            self.probing = True  # exactly one trial request at a time
+            return True
+        return False
+
+    def success(self):
+        self.state, self.failures, self.probing = "closed", 0, False
+
+    def failure(self):
+        self.probing = False
+        self.failures += 1
+        if self.state == "half_open" or self.failures >= self.threshold:
+            self.state, self.opened_at = "open", self.clock()
+
+    def release(self):
+        """The call ended without evidence about provider health (e.g. cancelled)."""
+        self.probing = False
+
+
+_BREAKERS: dict[tuple[str, str], CircuitBreaker] = {}
+
+
+def breaker_for(provider: str, model: str) -> CircuitBreaker:
+    if (provider, model) not in _BREAKERS:
+        config = settings()
+        _BREAKERS[(provider, model)] = CircuitBreaker(config.breaker_failure_threshold, config.breaker_cooldown_seconds)
+    return _BREAKERS[(provider, model)]
+
+
+class FailoverProvider(LLMProvider):
+    """Ordered provider chain with per-target circuit breakers.
+
+    Fails over only when the request was provably not processed, so a fallback can never
+    double-bill an uncertain call. Uncertain outcomes still trip the breaker, which makes
+    later calls skip the unhealthy provider instead of waiting on it.
+    """
+
+    def __init__(self, targets: list[tuple[str, str]]):
+        self.targets = targets
+
+    async def complete(self, system, data, schema):
+        skipped: list[str] = []
+        last_error: Exception | None = None
+        for name, model in self.targets:
+            label, breaker = f"{name}:{model}", breaker_for(name, model)
+            if not breaker.allow():
+                skipped.append(f"{label}:circuit_open")
+                continue
+            try:
+                completion = await PROVIDER_TYPES[name](model).complete(system, data, schema)
+            except StructuredResponseError as exc:
+                breaker.success()  # the provider answered; the answer was just invalid (and billed)
+                self._tag(exc.receipt, name, model, skipped)
+                raise
+            except RequestRejected as exc:
+                breaker.release()
+                skipped.append(f"{label}:rejected")
+                last_error = exc
+            except ProviderUnavailable as exc:
+                breaker.failure()
+                skipped.append(f"{label}:unavailable")
+                last_error = exc
+            except OutcomeUncertain:
+                breaker.failure()
+                raise
+            except BaseException:
+                breaker.release()
+                raise
+            else:
+                breaker.success()
+                return self._tag(completion, name, model, skipped)
+        if last_error is None:
+            raise ProviderUnavailable("No provider available: all circuits are open")
+        raise last_error
+
+    @staticmethod
+    def _tag(completion: Completion, name: str, model: str, skipped: list[str]) -> Completion:
+        completion.provider, completion.model, completion.failover = name, model, list(skipped) or None
+        return completion
+
+
 def llm() -> LLMProvider:
-    providers: dict[str, type[LLMProvider]] = {
-        "openai": OpenAIProvider,
-        "anthropic": AnthropicProvider,
-        "gemini": GeminiProvider,
-    }
-    if settings().llm_provider not in providers:
+    config = settings()
+    if config.llm_provider not in PROVIDER_TYPES:
         raise ValueError("Unsupported LLM_PROVIDER")
-    return providers[settings().llm_provider]()
+    if not config.llm_fallbacks:
+        return PROVIDER_TYPES[config.llm_provider]()
+    chain = [(config.llm_provider, config.llm_model), *((t.provider, t.model) for t in config.llm_fallbacks)]
+    return FailoverProvider(list(dict.fromkeys(chain)))
 
 
 class SearchProvider(ABC):
