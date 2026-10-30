@@ -25,16 +25,16 @@ from app.models.entities import (
     User,
     now,
 )
-from app.rag.pipeline import chunk_text, parse_document
+from app.rag.pipeline import chunk_text, parse_document, purge_document_vectors
 from app.repositories.tenant import owned, serialize
 from app.schemas.contracts import Credentials, Preferences, ProjectInput, Register, ResearchInput
 from app.security.auth import hasher, issue_session, principal, verify_password
-from app.security.guards import require_role
+from app.security.guards import digest, require_role, throttle
 from app.services.reports import export_pdf, markdown
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,10 +61,21 @@ async def enqueue(request, name, resource_id, **kwargs):
         raise HTTPException(503, "Background queue is unavailable") from None
 
 
+async def limit_auth(request: Request, scope: str, email: str, per_ip: int, per_account: int):
+    """Tight brute-force/abuse limits on top of the global per-IP admission control."""
+    client = digest(request.client.host if request.client else "unknown")
+    redis = request.app.state.redis
+    if not await throttle(redis, f"auth:{scope}:ip:{client}", per_ip) or not await throttle(
+        redis, f"auth:{scope}:acct:{digest(email.lower())}", per_account
+    ):
+        raise HTTPException(429, "Too many attempts; try again later", headers={"Retry-After": "60"})
+
+
 @router.post("/auth/register", status_code=201)
 async def register(body: Register, request: Request, response: Response, session: DB):
     if request.headers.get("origin") != settings().public_origin:
         raise HTTPException(403, "Invalid origin")
+    await limit_auth(request, "register", body.email, per_ip=10, per_account=3)
     organization = Organization(name=body.organization)
     user = User(
         email=body.email.lower(), name=body.name, password_hash=await asyncio.to_thread(hasher.hash, body.password)
@@ -84,6 +95,7 @@ async def register(body: Register, request: Request, response: Response, session
 async def login(body: Credentials, request: Request, response: Response, session: DB):
     if request.headers.get("origin") != settings().public_origin:
         raise HTTPException(403, "Invalid origin")
+    await limit_auth(request, "login", body.email, per_ip=20, per_account=8)
     user = await session.scalar(select(User).where(User.email == body.email.lower()))
     # Dummy Argon2 verification prevents a fast absent-user path.
     encoded = user.password_hash if user else request.app.state.dummy_hash
@@ -413,6 +425,24 @@ async def document(document_id: str, session: DB, identity: Identity):
         **serialize(doc),
         "chunk_count": await session.scalar(select(func.count(Chunk.id)).where(Chunk.document_id == doc.id)),
     }
+
+
+@router.delete("/documents/{document_id}", status_code=204)
+async def delete_document(document_id: str, session: DB, identity: Identity):
+    require_role(identity["role"], {"OWNER", "ADMIN"})
+    doc = await owned(session, Document, document_id, identity["org"])
+    if doc.status == "PROCESSING":
+        raise HTTPException(409, "Document is being indexed; try again shortly")
+    try:
+        # Vectors first: if this fails the rows remain and the delete can be retried.
+        await purge_document_vectors(doc)
+    except Exception:
+        raise HTTPException(503, "Vector index unavailable; document was not deleted") from None
+    await session.execute(delete(Chunk).where(Chunk.document_id == doc.id, Chunk.organization_id == identity["org"]))
+    await session.delete(doc)
+    audit(session, identity, "document_deleted", doc.id)
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.post("/documents/{document_id}/retry")

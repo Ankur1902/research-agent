@@ -26,6 +26,7 @@ def pack_evidence(sources, question: str, *, limit: int = 10, window: int = 2000
                     "untrusted_evidence": passage,
                     "evidence_offset": -negative_offset,
                     "evidence_truncated": len(passage) < len(text),
+                    "possible_embedded_instructions": bool((source.metadata_json or {}).get("suspicious_content")),
                 },
             )
         )

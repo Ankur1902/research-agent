@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -55,9 +56,21 @@ class LLMProvider(ABC):
     async def complete(self, system: str, data: dict, schema: type[BaseModel]) -> Completion: ...
 
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
+
+
+def retry_delay(attempt: int, response: httpx.Response | None) -> float:
+    """Honor Retry-After (capped) else exponential backoff with jitter."""
+    header = response.headers.get("retry-after", "") if response is not None else ""
+    if header.isdigit():
+        return min(float(header), 30.0)
+    return 2**attempt + random.uniform(0, 0.5)
+
+
 async def request_json(url, headers, body, *, retry_ambiguous=True):
     async with httpx.AsyncClient(timeout=90) as client:
         for attempt in range(MAX_PROVIDER_HTTP_ATTEMPTS):
+            last = attempt == MAX_PROVIDER_HTTP_ATTEMPTS - 1
             try:
                 response = await client.post(url, headers=headers, json=body)
                 response.raise_for_status()
@@ -66,18 +79,26 @@ async def request_json(url, headers, body, *, retry_ambiguous=True):
                     raise RuntimeError("Provider returned an invalid JSON envelope")
                 result["_researchos_http_attempts"] = attempt + 1
                 return result
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # The request never reached the provider, so replay cannot double-bill.
+                if last:
+                    raise RuntimeError("Provider unreachable after bounded retries") from None
+                await asyncio.sleep(retry_delay(attempt, None))
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in {429, 500, 502, 503, 504}:
-                    raise RequestRejected(f"Provider rejected request ({exc.response.status_code})") from None
+                failed = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+                if failed is not None and failed.status_code not in RETRYABLE_STATUS:
+                    raise RequestRejected(f"Provider rejected request ({failed.status_code})") from None
                 # Generation timeouts and server errors can follow accepted,
                 # billable work. Retry only an explicit throttle response.
-                if not retry_ambiguous and (
-                    not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429
-                ):
+                if not retry_ambiguous and (failed is None or failed.status_code != 429):
                     raise RuntimeError("Provider outcome uncertain; automatic replay disabled") from None
-                if attempt == MAX_PROVIDER_HTTP_ATTEMPTS - 1:
+                if last:
                     raise RuntimeError("Provider unavailable after bounded retries") from None
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(retry_delay(attempt, failed))
+            except httpx.RequestError:
+                raise RuntimeError("Provider connection failed") from None
+            except ValueError:
+                raise RuntimeError("Provider returned a non-JSON response") from None
     raise RuntimeError("Provider request failed")
 
 

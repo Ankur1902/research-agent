@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import router
-from app.core.config import settings
+from app.core.config import production_problems, settings
 from app.security.auth import hasher
 
 logger = logging.getLogger("researchos")
@@ -20,8 +20,8 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app):
-    if settings().environment == "production" and len(settings().auth_secret) < 32:
-        raise RuntimeError("AUTH_SECRET must be at least 32 characters in production")
+    if problems := production_problems(settings()):
+        raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
     app.state.dummy_hash = await asyncio.to_thread(hasher.hash, uuid.uuid4().hex)
     app.state.redis = await create_pool(RedisSettings.from_dsn(settings().redis_url))
     yield
@@ -33,7 +33,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings().public_origin],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token", "Last-Event-ID"],
 )
 app.include_router(router)

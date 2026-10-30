@@ -14,7 +14,7 @@ from app.core.db import Session
 from app.models.entities import Document, Event, Research, RunLease, Source, Usage, now
 from app.rag.pipeline import retrieve
 from app.schemas.contracts import Analysis, Assessment, Finding, Plan, Report
-from app.security.guards import detect_injection, digest
+from app.security.guards import detect_injection, digest, redact_secrets
 from app.services.budgets import reserve, settle
 from app.services.providers import RequestRejected, StructuredResponseError, llm
 from app.tools.registry import registry
@@ -209,7 +209,12 @@ class Workflow:
         for query in queries[:query_limit]:
             receipt = await reserve(self.session, self.job, settings().search_price_per_call, "search")
             await self.tool("web_search", {"query": query})
-            results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
+            try:
+                results = (await self.tools.call("web_search", {"query": query}, role="RESEARCHER", approved=True))[:4]
+            except (RequestRejected, ValueError):
+                # Declined before any search was performed: release the hold instead of leaking budget.
+                await settle(self.session, self.job, receipt, 0)
+                raise
             results = list({result["url"]: result for result in results}.values())
             await settle(self.session, self.job, receipt, settings().search_price_per_call)
 
@@ -263,7 +268,12 @@ class Workflow:
                     document.name,
                     f"document:{document.id}#page={chunk.page}",
                     chunk.text,
-                    {"page": chunk.page, "chunk_id": chunk.id, "type": "document"},
+                    {
+                        "page": chunk.page,
+                        "chunk_id": chunk.id,
+                        "type": "document",
+                        "suspicious_content": detect_injection(chunk.text),
+                    },
                 )
 
     async def plan(self):
@@ -293,6 +303,10 @@ class Workflow:
         if not evidence:
             raise ValueError("No retrievable evidence; upload indexed documents or check the search configuration")
         analysis = await self.generate("analyst", {"question": self.job.question, "evidence": evidence}, Analysis)
+        if any(item["possible_embedded_instructions"] for item in evidence):
+            analysis.limitations.append(
+                "Some sources contained instruction-like text; it was treated as data and never followed."
+            )
         by_citation = {source.citation: source for source in sources}
         for computation in analysis.computations:
             if len(analysis.findings) >= 30:
@@ -351,12 +365,15 @@ class Workflow:
             for index in section.finding_indices
         ):
             raise ValueError("Writer referenced an unknown finding")
-        self.job.report = {
-            **report.model_dump(),
-            "findings": [finding.model_dump() for finding in analysis.findings],
-            "sources": [{"citation": s.citation, "title": s.title, "url": s.url} for s in sources],
-            "mode": self.job.mode,
-        }
+        # Output guardrail: credential-shaped strings never reach storage or exports.
+        self.job.report = redact_secrets(
+            {
+                **report.model_dump(),
+                "findings": [finding.model_dump() for finding in analysis.findings],
+                "sources": [{"citation": s.citation, "title": s.title, "url": s.url} for s in sources],
+                "mode": self.job.mode,
+            }
+        )
         await self.transition("VERIFICATION", "REVIEW")
         await self.event("writer", "approval_required", "Evidence-backed draft ready for final review")
 
