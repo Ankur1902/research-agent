@@ -69,6 +69,9 @@ test("register, project, approved demo research, evidence, export and logout", a
       ),
     });
   await expect(page.getByText("evidence.txt")).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete evidence.txt" }).click();
+  await expect(page.getByText("evidence.txt")).toHaveCount(0);
   await page.goto("/evaluations");
   await page
     .getByRole("button", { name: "Run evaluation", exact: true })

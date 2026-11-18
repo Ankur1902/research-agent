@@ -4,7 +4,7 @@ import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileText, UploadCloud, ArrowUpRight } from "lucide-react";
 import { api } from "@/lib/api";
-import type { Document } from "@/lib/types";
+import type { Document, User } from "@/lib/types";
 import { PageHeading, Badge, ErrorMessage, Empty } from "./ui";
 export function Documents({ id }: { id?: string }) {
   const input = useRef<HTMLInputElement>(null);
@@ -20,6 +20,27 @@ export function Documents({ id }: { id?: string }) {
         ? 3000
         : false,
   });
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: () => api<User>("/auth/me"),
+  });
+  // Mirrors the server rule; the API still enforces it.
+  const canDelete = ["OWNER", "ADMIN"].includes(me?.role ?? "");
+  async function remove(doc: Document) {
+    if (
+      !window.confirm(
+        `Delete ${doc.name}? Its text, chunks and search vectors are removed. This cannot be undone.`,
+      )
+    )
+      return;
+    setFailure("");
+    try {
+      await api(`/documents/${doc.id}`, { method: "DELETE" });
+      await client.invalidateQueries({ queryKey: ["documents"] });
+    } catch (e) {
+      setFailure((e as Error).message);
+    }
+  }
   const { data: document } = useQuery({
     queryKey: ["document", id],
     queryFn: () => api<Document>(`/documents/${id}`),
@@ -166,6 +187,15 @@ export function Documents({ id }: { id?: string }) {
                       }}
                     >
                       Retry
+                    </button>
+                  )}
+                  {canDelete && doc.status !== "PROCESSING" && (
+                    <button
+                      className="text-button"
+                      aria-label={`Delete ${doc.name}`}
+                      onClick={() => remove(doc)}
+                    >
+                      Delete
                     </button>
                   )}
                   <ArrowUpRight size={17} />

@@ -26,5 +26,6 @@ export async function api<T>(
         : "Please check the form fields",
     );
   }
+  if (response.status === 204) return undefined as T; // e.g. DELETE: success with no body
   return response.json();
 }
