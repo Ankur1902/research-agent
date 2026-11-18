@@ -14,7 +14,7 @@ Tenants, submitted questions, uploaded files, retrieved pages and LLM output are
 - Same-origin frontend proxy; no API credentials sent to clients. React text escaping and escaped report HTML/PDF text. JSON logs exclude request bodies and credentials.
 - Browser hardening: a per-request nonce Content-Security-Policy with `strict-dynamic` (`apps/web/proxy.ts`), HSTS, `Permissions-Policy`, `frame-ancestors 'none'` and COOP. API responses carry `default-src 'none'; sandbox`, so even the HTML export cannot run script.
 - Per-account and per-IP throttling on login and registration. Client identity comes from `X-Forwarded-For` only through `TRUSTED_PROXY_COUNT` trusted proxies, counting from the right, so spoofed left-hand entries are ignored.
-- Supply chain: CI fails on known vulnerabilities (`pip-audit` on the API requirements, `npm audit --audit-level=high` on the web app), and Dependabot opens weekly update PRs for Python, npm and GitHub Actions.
+- Supply chain: CI fails on known vulnerabilities in what ships (`pip-audit` on the API requirements; `npm audit --omit=dev --audit-level=high` on the web app's production dependencies). The full npm tree, including lint and type-check tooling that never ships, is audited too but reported without failing the build, because advisories there can have no fixed release. Dependabot opens weekly update PRs for Python, npm and GitHub Actions.
 - Expired login sessions are purged hourly by the worker; they already fail authentication, so this bounds table growth rather than closing a hole.
 - Redis rate limits, agent step / context / tool limits, per-research spending ceilings and organization recorded-cost ceiling. Docker internal services are not published to host ports.
 
