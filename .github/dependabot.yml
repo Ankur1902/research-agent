@@ -1,0 +1,17 @@
+# Weekly dependency update PRs. Minor and patch bumps are grouped to keep review noise low;
+# majors arrive individually because they can need code changes (as zod 3 -> 4 did).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /apps/api
+    schedule: {interval: weekly}
+    groups:
+      python-minor-patch: {update-types: [minor, patch]}
+  - package-ecosystem: npm
+    directory: /apps/web
+    schedule: {interval: weekly}
+    groups:
+      npm-minor-patch: {update-types: [minor, patch]}
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}

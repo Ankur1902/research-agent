@@ -14,6 +14,8 @@ Tenants, submitted questions, uploaded files, retrieved pages and LLM output are
 - Same-origin frontend proxy; no API credentials sent to clients. React text escaping and escaped report HTML/PDF text. JSON logs exclude request bodies and credentials.
 - Browser hardening: a per-request nonce Content-Security-Policy with `strict-dynamic` (`apps/web/proxy.ts`), HSTS, `Permissions-Policy`, `frame-ancestors 'none'` and COOP. API responses carry `default-src 'none'; sandbox`, so even the HTML export cannot run script.
 - Per-account and per-IP throttling on login and registration. Client identity comes from `X-Forwarded-For` only through `TRUSTED_PROXY_COUNT` trusted proxies, counting from the right, so spoofed left-hand entries are ignored.
+- Supply chain: CI fails on known vulnerabilities (`pip-audit` on the API requirements, `npm audit --audit-level=high` on the web app), and Dependabot opens weekly update PRs for Python, npm and GitHub Actions.
+- Expired login sessions are purged hourly by the worker; they already fail authentication, so this bounds table growth rather than closing a hole.
 - Redis rate limits, agent step / context / tool limits, per-research spending ceilings and organization recorded-cost ceiling. Docker internal services are not published to host ports.
 
 ```mermaid
@@ -35,7 +37,7 @@ The Caddyfile could not be executed in the authoring environment. CI validates i
 
 **CSP scope.** The CSP was verified in headless Chromium on the public pages (no violations, hydration intact, fresh nonce per request). Signed-in pages were not exercised without a running API; the Playwright job in CI is the check for those. Every page now renders dynamically, which nonces require.
 
-This is a portfolio implementation, not a completed enterprise security certification. Add managed TLS, secret rotation, MFA/SSO, delivered password recovery and email verification, malware scanning, backups, dependency scans and external penetration testing before public production exposure. The current parser runs in a thread within the API; hostile PDFs require process/container isolation. Lexical retrieval is capped at 10,000 chunks; use a scalable tenant-filtered lexical index at larger scale. Generation pricing is configured rather than fetched from vendor billing.
+This is a portfolio implementation, not a completed enterprise security certification. Add managed TLS, secret rotation, MFA/SSO, delivered password recovery and email verification, malware scanning, backups and external penetration testing before public production exposure. The current parser runs in a thread within the API; hostile PDFs require process/container isolation. Lexical retrieval is capped at 10,000 chunks; use a scalable tenant-filtered lexical index at larger scale. Generation pricing is configured rather than fetched from vendor billing.
 
 Organization ceilings apply to cumulative recorded costs and are not atomic cross-job reservations; concurrent provider calls can overshoot. Task-level preflight reserves configured output capacity but tokenization is conservative approximation. Add transactional organization reservations and separate search/embedding ledgers before paid multi-tenant deployment. Budget exhaustion does not interrupt an in-flight provider call. Cancellation is cooperative; it stops at the next checkpoint.
 
