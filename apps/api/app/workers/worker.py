@@ -2,11 +2,12 @@ from app.agents.workflow import run_research
 from app.core.config import settings
 from app.core.db import Session
 from app.core.telemetry import setup_tracing, shutdown_tracing
-from app.models.entities import Document
+from app.models.entities import Document, LoginSession, now
 from app.rag.pipeline import index_document
 from app.workers.recovery import recover_research
 from arq import cron
 from arq.connections import RedisSettings
+from sqlalchemy import delete
 
 
 async def ingest_document(ctx, document_id):
@@ -26,6 +27,13 @@ async def ingest_document(ctx, document_id):
             await session.commit()
 
 
+async def purge_expired_sessions(ctx):
+    """Expired sessions already fail authentication; this keeps the table from growing forever."""
+    async with Session() as session:
+        await session.execute(delete(LoginSession).where(LoginSession.expires_at < now()))
+        await session.commit()
+
+
 async def startup(ctx):
     setup_tracing()
     await recover_research(ctx)
@@ -43,4 +51,7 @@ class WorkerSettings:
     max_tries = 2
     on_startup = startup
     on_shutdown = shutdown
-    cron_jobs = [cron(recover_research, second={0, 30}, unique=True)]
+    cron_jobs = [
+        cron(recover_research, second={0, 30}, unique=True),
+        cron(purge_expired_sessions, minute={17}, second={0}, unique=True),
+    ]

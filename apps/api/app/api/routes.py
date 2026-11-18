@@ -455,15 +455,28 @@ async def retry_document(document_id: str, request: Request, session: DB, identi
     return {"ok": True}
 
 
+ACTIVE_STATUSES = ("QUEUED", "PLANNING", "APPROVED", "RUNNING", "VERIFICATION")
+
+
 @router.get("/dashboard")
 async def dashboard(session: DB, identity: Identity):
-    jobs = list((await session.scalars(select(Research).where(Research.organization_id == identity["org"]))).all())
-    counts: dict[str, int] = {}
-    for job in jobs:
-        day = job.created_at.date().isoformat()
-        counts[day] = counts.get(day, 0) + 1
-    completed = [job for job in jobs if job.status == "COMPLETED"]
-    durations = [(job.finished_at - job.created_at).total_seconds() for job in completed if job.finished_at]
+    # Aggregate in SQL: loading every research row (with report and plan JSON) grew with the organization.
+    mine = Research.organization_id == identity["org"]
+    statuses = dict(
+        (await session.execute(select(Research.status, func.count()).where(mine).group_by(Research.status))).all()
+    )
+    day = func.date(Research.created_at)
+    volume = {str(d): n for d, n in (await session.execute(select(day, func.count()).where(mine).group_by(day))).all()}
+    # Duration arithmetic differs between MySQL and SQLite, so fetch only the two timestamps.
+    spans = (
+        await session.execute(
+            select(Research.created_at, Research.finished_at).where(
+                mine, Research.status == "COMPLETED", Research.finished_at.is_not(None)
+            )
+        )
+    ).all()
+    durations = [(finished - created).total_seconds() for created, finished in spans if finished]
+    recent = await session.scalars(select(Research).where(mine).order_by(Research.created_at.desc()).limit(6))
     return {
         "projects": await session.scalar(
             select(func.count(Project.id)).where(Project.organization_id == identity["org"])
@@ -473,12 +486,12 @@ async def dashboard(session: DB, identity: Identity):
                 Document.organization_id == identity["org"], Document.status == "INDEXED"
             )
         ),
-        "active": sum(job.status in {"QUEUED", "PLANNING", "APPROVED", "RUNNING", "VERIFICATION"} for job in jobs),
-        "reports": len(completed),
-        "cost": sum(job.cost for job in jobs),
+        "active": sum(statuses.get(status, 0) for status in ACTIVE_STATUSES),
+        "reports": statuses.get("COMPLETED", 0),
+        "cost": float(await session.scalar(select(func.coalesce(func.sum(Research.cost), 0)).where(mine)) or 0),
         "average_duration": sum(durations) / len(durations) if durations else None,
-        "volume": counts,
-        "recent": [serialize(job) for job in sorted(jobs, key=lambda job: job.created_at, reverse=True)[:6]],
+        "volume": volume,
+        "recent": [serialize(job) for job in recent],
     }
 
 
