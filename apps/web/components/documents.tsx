@@ -6,6 +6,8 @@ import { FileText, CloudUpload, ArrowUpRight } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Document, User } from "@/lib/types";
 import { PageHeading, Badge, ErrorMessage, Empty } from "./ui";
+const INDEXING = ["QUEUED", "PROCESSING"];
+
 export function Documents({ id }: { id?: string }) {
   const input = useRef<HTMLInputElement>(null);
   const client = useQueryClient();
@@ -16,9 +18,7 @@ export function Documents({ id }: { id?: string }) {
     queryKey: ["documents"],
     queryFn: () => api<Document[]>("/documents"),
     refetchInterval: (query) =>
-      query.state.data?.some((d) => ["QUEUED", "PROCESSING"].includes(d.status))
-        ? 3000
-        : false,
+      query.state.data?.some((d) => INDEXING.includes(d.status)) ? 3000 : false,
   });
   const { data: me } = useQuery({
     queryKey: ["me"],
@@ -39,6 +39,8 @@ export function Documents({ id }: { id?: string }) {
       await client.invalidateQueries({ queryKey: ["documents"] });
     } catch (e) {
       setFailure((e as Error).message);
+      // A refusal usually means the status moved on (e.g. indexing started); show the current one.
+      await client.invalidateQueries({ queryKey: ["documents"] });
     }
   }
   const { data: document } = useQuery({
@@ -189,7 +191,9 @@ export function Documents({ id }: { id?: string }) {
                       Retry
                     </button>
                   )}
-                  {canDelete && doc.status !== "PROCESSING" && (
+                  {/* Hidden for the whole indexing window: a QUEUED row can turn PROCESSING at any
+                      moment, and the API refuses deletes mid-indexing. */}
+                  {canDelete && !INDEXING.includes(doc.status) && (
                     <button
                       className="text-button"
                       aria-label={`Delete ${doc.name}`}
