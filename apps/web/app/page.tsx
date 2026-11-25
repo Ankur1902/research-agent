@@ -1,7 +1,7 @@
 import Link from "next/link";
 import {
   ArrowRight,
-  Layers3,
+  Layers,
   ShieldCheck,
   Workflow,
   BookOpen,
@@ -12,7 +12,7 @@ export default function Landing() {
     <div className="landing">
       <nav>
         <Link className="brand" href="/">
-          <Layers3 size={25} />
+          <Layers size={25} />
           Research<span>OS</span>
         </Link>
         <div>

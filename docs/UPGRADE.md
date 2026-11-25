@@ -1,4 +1,26 @@
-# Reliability and evidence upgrade
+# Runtime and dependency upgrade (November 2026)
+
+## Changes
+
+- Runtimes: the API image and CI move from Python 3.11 to 3.13; the web image and CI move from Node 22 to Node 24 (current LTS). `@types/node` follows the runtime (24.x), and Dependabot skips its major bumps so types never run ahead of Node.
+- Python: pypdf 7, reportlab 5 and mypy 2 adopted; floors raised to the tested versions for FastAPI, SQLAlchemy, Alembic, arq, Qdrant client, OpenTelemetry and others.
+- Web: TypeScript 6.0 (pinned `~6.0.3`), lucide-react 1.x with icons moved off legacy aliases (`AlertCircle`, `UploadCloud`, `Layers3`), plus minor and patch updates across React, TanStack Query, Tailwind and Playwright.
+- Services: Qdrant 1.20.2 (matches the 1.20 client) and Caddy 2.11.9.
+- No database migration. Rebuild images with `docker compose build --pull`; for local development use Python 3.13 and Node 24.
+
+## Held back, with reasons
+
+| Upgrade | Why not yet |
+|---|---|
+| TypeScript 7 | typescript-eslint, used by Next's lint config, supports TypeScript `<6.1`; lint crashes on 7. Typecheck and build passed. |
+| ESLint 10 | eslint-plugin-react, -import and -jsx-a11y (bundled by eslint-config-next) do not declare ESLint 10 support. |
+| redis 8 (Python) | arq requires `redis<6`. |
+
+## Verification
+
+Backend: 155 passed, 1 skipped (Qdrant integration). Web: lint, typecheck and production build under Node 24.22.3. Browser end-to-end test: 8/8 runs passed under Node 24. pip-audit and npm audit report no known vulnerabilities. Docker images were not built locally; CI builds and runs them.
+
+# Reliability and evidence upgrade (October 2026)
 
 This release implements the first reliability and evidence improvements from the October 2026 review. It preserves Gemini, the four model stages, plan/report approvals, and the lightweight default evaluation set.
 

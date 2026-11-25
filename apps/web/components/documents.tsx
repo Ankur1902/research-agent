@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FileText, UploadCloud, ArrowUpRight } from "lucide-react";
+import { FileText, CloudUpload, ArrowUpRight } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Document, User } from "@/lib/types";
 import { PageHeading, Badge, ErrorMessage, Empty } from "./ui";
@@ -100,7 +100,7 @@ export function Documents({ id }: { id?: string }) {
         action={
           !id ? (
             <button className="button" onClick={() => input.current?.click()}>
-              <UploadCloud size={17} />
+              <CloudUpload size={17} />
               Upload document
             </button>
           ) : undefined
@@ -142,7 +142,7 @@ export function Documents({ id }: { id?: string }) {
             }}
           >
             <span>
-              <UploadCloud size={26} />
+              <CloudUpload size={26} />
             </span>
             <h3>
               {uploading

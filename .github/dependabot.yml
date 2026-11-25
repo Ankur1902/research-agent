@@ -12,6 +12,10 @@ updates:
     schedule: {interval: weekly}
     groups:
       npm-minor-patch: {update-types: [minor, patch]}
+    ignore:
+      # Types must match the Node runtime (Dockerfile and CI); move them together with it.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}

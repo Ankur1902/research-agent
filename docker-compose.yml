@@ -32,7 +32,7 @@ services:
       timeout: 3s
       retries: 20
   qdrant:
-    image: qdrant/qdrant:v1.19.0
+    image: qdrant/qdrant:v1.20.2
     volumes: [qdrant-data:/qdrant/storage]
   migrate:
     build: {context: ., dockerfile: docker/api.Dockerfile}
@@ -70,7 +70,7 @@ services:
     depends_on:
       api: {condition: service_healthy}
   edge:
-    image: caddy:2.8-alpine
+    image: caddy:2.11.9-alpine
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

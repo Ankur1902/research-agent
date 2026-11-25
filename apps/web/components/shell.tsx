@@ -4,7 +4,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import {
-  Layers3,
+  Layers,
   LayoutDashboard,
   FolderOpen,
   BookOpen,
@@ -44,7 +44,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
   if (!user)
     return (
       <div className="loading-page">
-        <Layers3 />
+        <Layers />
         <p>{error ? error.message : "Opening your workspace…"}</p>
         {error && <Link href="/login">Sign in</Link>}
       </div>
@@ -60,7 +60,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
       </button>
       <aside className={`sidebar ${open ? "open" : ""}`}>
         <Link className="brand" href="/dashboard">
-          <Layers3 size={25} />
+          <Layers size={25} />
           Research<span>OS</span>
         </Link>
         <div className="workspace-switch">

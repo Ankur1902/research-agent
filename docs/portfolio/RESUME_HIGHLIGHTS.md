@@ -13,7 +13,7 @@ Built ResearchOS, a multi-tenant multi-agent research platform (FastAPI, ARQ, My
 - **Cost governance:** Implemented database-serialized spend reservations and settlement receipts per organization and per run, preventing concurrent jobs from silently exceeding budgets.
 - **Security engineering:** SSRF-safe fetching (DNS validation, IP pinning, per-redirect checks), Argon2 with hashed server sessions, CSRF and origin checks, tenant-scoped queries and vector filters, per-account login throttling, and secret redaction on model output.
 - **Resilience:** Compare-and-swap state transitions, lease-based recovery of abandoned runs, and provider retries that replay only when it cannot double-bill (connect failures and explicit throttles).
-- **Evaluation:** Shipped an LLM security-eval harness (22 cases), a trajectory eval, a deterministic guardrail regression (`scripts/guardrail_eval.py`) and a pytest suite of 152 tests, all gated in CI.
+- **Evaluation:** Shipped an LLM security-eval harness (22 cases), a trajectory eval, a deterministic guardrail regression (`scripts/guardrail_eval.py`) and a pytest suite of 155 tests, all gated in CI.
 - **Provider failover:** Built an ordered multi-provider chain with per-model circuit breakers that fails over only when a request is provably unprocessed, so an uncertain billable call is never replayed on a second vendor; cost and usage are attributed to the model that actually served each call (`docs/FAILOVER.md`).
 - **Observability:** Added opt-in OpenTelemetry tracing across the agent pipeline using the GenAI semantic conventions (model, token usage, estimated cost, failover decisions per call), with a privacy contract enforced by tests: no questions, prompts, evidence or exception messages ever leave the process (`docs/OBSERVABILITY.md`).
 - **Data lifecycle:** Tenant-scoped, audited document deletion that purges vectors first and fails closed.
@@ -22,7 +22,7 @@ Built ResearchOS, a multi-tenant multi-agent research platform (FastAPI, ARQ, My
 
 | Claim | Command | Result at writing |
 |---|---|---|
-| Automated tests | `python -m pytest -q` | 152 passed, 1 skipped (Qdrant integration, needs Docker) |
+| Automated tests | `python -m pytest -q` | 155 passed, 1 skipped (Qdrant integration, needs Docker) |
 | Guardrail corpus | `python scripts/guardrail_eval.py` | 42 cases; injection 10/10 blocked, SSRF 16/16, secret redaction 6/6; 1 documented false positive in 8 benign injection cases |
 | Static checks | `ruff check`, `mypy apps/api/app` | clean |
 

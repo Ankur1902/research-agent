@@ -5,7 +5,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { ArrowRight, Layers3 } from "lucide-react";
+import { ArrowRight, Layers } from "lucide-react";
 import { api, setCSRF } from "@/lib/api";
 import type { User } from "@/lib/types";
 const schema = z.object({
@@ -44,7 +44,7 @@ export function AuthForm({ registering = false }: { registering?: boolean }) {
     <div className="auth-page">
       <aside>
         <Link href="/" className="brand">
-          <Layers3 />
+          <Layers />
           Research<span>OS</span>
         </Link>
         <div>

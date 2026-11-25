@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ShieldCheck, Check, AlertCircle } from "lucide-react";
+import { ShieldCheck, Check, CircleExclamationPoint } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Settings as Data, User } from "@/lib/types";
 import { PageHeading, ErrorMessage } from "./ui";
@@ -166,7 +166,7 @@ export function Settings({ tab = "organization" }: { tab?: string }) {
 function Status({ ready }: { ready: boolean }) {
   return (
     <span className={ready ? "ready" : "error"}>
-      {ready ? <Check size={15} /> : <AlertCircle size={15} />}{" "}
+      {ready ? <Check size={15} /> : <CircleExclamationPoint size={15} />}{" "}
       {ready ? "Configured" : "Needs configuration"}
     </span>
   );
