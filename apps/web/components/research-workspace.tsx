@@ -80,6 +80,20 @@ export function ResearchWorkspace({
     });
     return () => stream.close();
   }, [id, job, client]);
+  async function openCitation(key: string) {
+    let source = sources.find((s) => s.citation === key);
+    if (!source) {
+      // The report and the source list refresh independently, so the report can render first.
+      // Fetch the list instead of silently ignoring the click.
+      const fresh = await client.fetchQuery({
+        queryKey: ["sources", id],
+        queryFn: () => api<Source[]>(`/research/${id}/sources`),
+        staleTime: 0,
+      });
+      source = fresh.find((s) => s.citation === key);
+    }
+    setSelected(source ?? null);
+  }
   async function action(name: string) {
     setBusy(true);
     setActionError("");
@@ -343,12 +357,7 @@ export function ResearchWorkspace({
                           {finding.citations.map((key) => (
                             <button
                               className="citation-link"
-                              onClick={() =>
-                                setSelected(
-                                  sources.find((s) => s.citation === key) ||
-                                    null,
-                                )
-                              }
+                              onClick={() => openCitation(key)}
                               key={key}
                             >
                               [{key}]
