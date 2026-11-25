@@ -4,6 +4,7 @@ import asyncio
 import os
 import secrets
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -36,13 +37,20 @@ from app.workers.worker import ingest_document  # noqa: E402
 class TestQueue:
     def __init__(self):
         self.counts = {}
+        self.expires = {}
         self.jobs = asyncio.Queue()
 
     async def incr(self, key):
+        # Honour TTLs like Redis; otherwise rate-limit windows never reset and repeated local
+        # browser runs are locked out of registration after ten sign-ups.
+        if self.expires.get(key, float("inf")) <= time.monotonic():
+            self.counts.pop(key, None)
+            self.expires.pop(key, None)
         self.counts[key] = self.counts.get(key, 0) + 1
         return self.counts[key]
 
     async def expire(self, key, ttl):
+        self.expires[key] = time.monotonic() + ttl
         return True
 
     async def enqueue_job(self, name, resource_id, **kwargs):
